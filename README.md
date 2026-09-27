@@ -23,6 +23,9 @@ Claude Code のセッション(メインエージェント + サブエージェ�
 
 詳細な設計は [DESIGN.md](./DESIGN.md) を参照してください。
 
+> [!TIP]
+> git や Node.js、ターミナルの操作に慣れていない方は、[はじめてのセットアップガイド(GUIDE.md)](./GUIDE.md) から始めてください。ZIP でダウンロードする方法で、インストール・起動・画面の見方を順に説明しています。
+
 ## 動作環境
 
 | 項目        | 要件                       |
@@ -33,6 +36,8 @@ Claude Code のセッション(メインエージェント + サブエージェ�
 | ブラウザ    | Chrome / Edge / Safari     |
 
 ## セットアップ
+
+git を使わずに ZIP で入れる手順や、Node.js の入れ方は [GUIDE.md](./GUIDE.md) にあります。
 
 ### Windows(PowerShell)
 
