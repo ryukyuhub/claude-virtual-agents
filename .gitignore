@@ -1,0 +1,14 @@
+node_modules
+
+# CLAUDE.md と .claude/agents/ は意図的に Git 管理する(Claude Code の設定と
+# カスタムエージェントをリポジトリで共有するため)。ignore しないこと。
+# 個人用の指示と許可設定は共有しない
+CLAUDE.local.md
+.claude/settings.local.json
+
+# ローカル設定(.env.example をコピーして作る)
+.env
+.env.local
+
+# Mac
+.DS_Store

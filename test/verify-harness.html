@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>CVA 検証ハーネス</title>
+<style>body { margin: 0; background: #fff; } #stage { width: 1000px; }</style>
+</head>
+<body>
+<div id="stage"></div>
+<script src="../public/vendor/pixi.min.js"></script>
+<script>
+/*
+ * 検証ハーネス(test/verify.mjs から使う)。
+ *
+ * 実ブラウザで見た目を「実測」するための土台。過去に踏んだ罠を最初から
+ * 避けてあるので、検証スクリプトはここを使うこと(使い捨てで書き直さない)。
+ *
+ * 避けている罠:
+ * 1. 描画回数の爆発 — PixiJS は ticker に描画を登録している。状態を安定させる
+ *    ために ticker を 300 回進めると 300 回描画され、ソフトウェア描画の
+ *    ヘッドレスでは 1 回の検証が 10 分を超える。描画リスナーを外し、
+ *    step() の最後に 1 回だけ描く(6000 回 → 20 回)
+ * 2. ticker の時刻起点 — stop() のあと update(16.7) から始めると dt が負になり、
+ *    alpha が減ってキャラが不可視のまま止まる。lastTime を起点にする
+ * 3. WebGL のバッファ — preserveDrawingBuffer が無いと、描いたフレームが合成の
+ *    たびに破棄され、別の evaluate から読むと空になる(計測が全部 0 になる)
+ */
+window.__apps = [];
+(function () {
+  const Orig = PIXI.Application;
+  PIXI.Application = function (opts, ...rest) {
+    const a = new Orig(Object.assign({}, opts, { preserveDrawingBuffer: true }), ...rest);
+    window.__apps.push(a);
+    return a;
+  };
+  PIXI.Application.prototype = Orig.prototype;
+})();
+// キャラの seed は Math.random() 由来。決定論にするため固定する
+Math.random = () => 0;
+</script>
+<script src="../public/character.js"></script>
+<script>window.__newKit = CVA.charKit;</script>
+<script src="../public/office.js"></script>
+<script src="../public/remote.js"></script>
+<script>
+'use strict';
+const stage = document.getElementById('stage');
+let current = null;
+
+// 論理サイズ(office.js / remote.js の W と同じ値)。**検証は等倍で行う**ため、
+// レンダラーを作る前にステージの幅を論理幅ちょうどに合わせる。
+// #55 で拡大するようになったので、幅を固定(1000px)のままにすると
+// s = 1000/960 = 1.04 のような半端な倍率になり、**画素で測っている値が全部ずれる**
+// (目の遮蔽・真円の半径・接続先の札の面積・ボスの回帰の基準)。
+// 高さ側は #51 の「表示が縮んでも文字がつぶれない」だけが意図的に縮める
+const LOGICAL_W = { office: 960, vertical: 380, horizontal: 960 };
+
+// stageW を渡すとステージの幅をその値にする(拡大表示を測る検証だけが使う)
+function makeRenderer(kind, opts, kit, stageW) {
+  if (current) { current.renderer.destroy(); stage.innerHTML = ''; window.__apps.length = 0; }
+  const key = kind === 'remote'
+    ? ((opts && opts.orientation) === 'horizontal' ? 'horizontal' : 'vertical')
+    : 'office';
+  stage.style.width = (stageW || LOGICAL_W[key]) + 'px';
+  CVA.charKit = kit || window.__newKit;
+  const renderer = kind === 'remote'
+    ? CVA.createRemoteRenderer(stage, opts || {})
+    : CVA.createOfficeRenderer(stage, opts || {});
+  const app = window.__apps[window.__apps.length - 1];
+  app.ticker.stop();
+  app.ticker.remove(app.render, app); // 毎 tick の自動描画を外す(罠 1)
+  current = { renderer, app, t: app.ticker.lastTime || 0 }; // 起点は lastTime(罠 2)
+  return current;
+}
+
+function step(n, dtMs) {
+  const { app } = current;
+  const d = dtMs || 1000 / 60;
+  for (let i = 0; i < n; i++) {
+    current.t += d;
+    app.ticker.update(current.t);
+  }
+  app.render(); // 最後に 1 回だけ
+}
+
+function pixels() {
+  const src = stage.querySelector('canvas');
+  const cv = document.createElement('canvas');
+  cv.width = src.width; cv.height = src.height;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(src, 0, 0);
+  return ctx.getImageData(0, 0, cv.width, cv.height);
+}
+
+// 指定色に完全一致する画素を数える(アンチエイリアスの縁は数えない)
+function countColor(img, hex) {
+  const r = (hex >> 16) & 255, g = (hex >> 8) & 255, b = hex & 255;
+  const d = img.data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i] === r && d[i + 1] === g && d[i + 2] === b) n++;
+  return n;
+}
+
+// 指定色の画素の外接範囲。PIXI の getBounds() は使わない
+// (回転パーツで AABB が膨張し、白フチや影も数えられないため)
+function boundsOfColor(img, hex) {
+  const r = (hex >> 16) & 255, g = (hex >> 8) & 255, b = hex & 255;
+  const d = img.data, w = img.width;
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] === r && d[i + 1] === g && d[i + 2] === b) {
+      const p = i / 4, x = p % w, y = (p / w) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  return x1 < 0 ? null : { x0, y0, x1, y1 };
+}
+
+// 背景色でない画素の外接範囲(枠内に収まっているかの判定に使う)
+function inkBounds(img, bgList) {
+  const d = img.data, w = img.width;
+  const bg = new Set(bgList);
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+  for (let i = 0; i < d.length; i += 4) {
+    const key = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2];
+    if (!bg.has(key)) {
+      const p = i / 4, x = p % w, y = (p / w) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  }
+  return x1 < 0 ? null : { x0, y0, x1, y1 };
+}
+
+function toArray(img) { return Array.from(img.data); }
+
+// 背景以外の画素数。「空の画面どうしを比べて差分 0」を検出するための自己検査に使う
+function inkCount(img, bg) {
+  const d = img.data;
+  const r = (bg >> 16) & 255, g = (bg >> 8) & 255, b = bg & 255;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (!(d[i] === r && d[i + 1] === g && d[i + 2] === b)) n++;
+  }
+  return n;
+}
+
+window.H = {
+  makeRenderer, step, pixels, countColor, boundsOfColor, inkBounds, inkCount, toArray,
+  apply: (s, stats) => current.renderer.applyState(s, stats),
+  // 色は造形の変更で変わるため、検証側は charKit から取る(定数を二重に持たない)。
+  // ボスの機体色は「充電中に手足が収まったか(オレンジの足が 0 画素か)」と
+  // 「球体の輪郭が真円か(球体を作る 3 色だけを追う)」の実測に使う(#47)
+  colors: () => ({
+    bossEye: CVA.charKit.EYE,
+    haloEye: CVA.charKit.HALO_EYE,
+    bossArmor: CVA.charKit.BOSS_SUIT.armor,
+    bossBelly: CVA.charKit.BOSS_SUIT.belly,
+    bossFoot: CVA.charKit.BOSS_SUIT.foot,
+    bossTrim: CVA.charKit.BOSS_SUIT.trim,
+  }),
+};
+</script>
+</body>
+</html>

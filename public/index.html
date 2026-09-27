@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Virtual Agents</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Claude Virtual Agents<span class="sub">エージェントオフィス</span></h1>
+  <div class="controls-row">
+    <div class="seg" role="group" aria-label="表示モード">
+      <button id="mode-office" aria-pressed="true">オフィス</button>
+      <button id="mode-remote" aria-pressed="false">リモート</button>
+    </div>
+    <div class="seg" role="group" aria-label="リモートの向き">
+      <button id="layout-v" aria-pressed="true">縦</button>
+      <button id="layout-h" aria-pressed="false">横</button>
+    </div>
+    <span id="status">接続中…</span>
+  </div>
+</header>
+<div id="banner" hidden>接続待ち… サーバー(npm start)の起動を確認してください。3秒ごとに再接続します。</div>
+<div id="office"></div>
+<script src="/vendor/pixi.min.js"></script>
+<script src="/character.js"></script>
+<script src="/office.js"></script>
+<script src="/remote.js"></script>
+<script src="/adapters.js"></script>
+<script src="/mock.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
