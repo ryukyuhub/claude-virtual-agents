@@ -13,6 +13,7 @@
  *   (次に本物の Hook イベントが届けば元に戻る)。
  */
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -649,6 +650,66 @@ async function checkProjectColor() {
   return lines;
 }
 
+// ---- 起動時の入れ替え(takeover.js)-----------------------------------------
+// 同じポートで前のサーバーが動いたままでも落ちず、**前のサーバーを終了させて
+// 入れ替わる**こと。別のアプリが使っているポートでは **何も止めずに** 終了コード 1
+// で終わること。**ポートは 3895 / 3894** —— 3896 は色、3897 は #70、3898 は #66、
+// 3899 は verify.mjs が使う
+const TAKEOVER_PORT = 3895;
+const FOREIGN_PORT = 3894;
+
+function startServer(port) {
+  const srv = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+    env: Object.assign({}, process.env, { CVA_PORT: String(port) }),
+    stdio: 'ignore',
+  });
+  srv.exited = new Promise((resolve) => srv.on('exit', (code) => resolve(code)));
+  return srv;
+}
+
+// ms 以内に終わらなければ 'alive'
+function exitCodeWithin(srv, ms) {
+  return Promise.race([srv.exited, sleep(ms).then(() => 'alive')]);
+}
+
+async function checkTakeover() {
+  const lines = [];
+  const base = `http://127.0.0.1:${TAKEOVER_PORT}`;
+  const first = startServer(TAKEOVER_PORT);
+  let second = null;
+  let third = null;
+  const foreign = http.createServer((req, res) => res.writeHead(404).end());
+  try {
+    for (let i = 0; i < 25; i++) {
+      try { await fetch(`${base}/state`); break; } catch (e) { await sleep(200); }
+    }
+    second = startServer(TAKEOVER_PORT);
+    const firstExit = await exitCodeWithin(first, 8000);
+    // 1 台目が終わったあとに応答するのは 2 台目だけ
+    let up = false;
+    for (let i = 0; i < 25 && !up; i++) {
+      try { up = (await fetch(`${base}/state`)).ok; } catch (e) { /* 入れ替わりの途中 */ }
+      if (!up) await sleep(200);
+    }
+    const swapped = firstExit === 0 && up && second.exitCode === null;
+    lines.push(`同じアプリ: 前のサーバー 終了コード ${firstExit} / 後のサーバー ${up ? '応答あり' : '応答なし'}`
+      + `(期待値 0 / 応答あり)${swapped ? '' : ' ← NG'}`);
+
+    await new Promise((resolve) => foreign.listen(FOREIGN_PORT, '127.0.0.1', resolve));
+    third = startServer(FOREIGN_PORT);
+    const thirdExit = await exitCodeWithin(third, 8000);
+    const kept = thirdExit === 1 && foreign.listening;
+    lines.push(`別のアプリ: 起動した側 終了コード ${thirdExit} / 別のアプリ ${foreign.listening ? '動いたまま' : '止まった'}`
+      + `(期待値 1 / 動いたまま)${kept ? '' : ' ← NG'}`);
+  } catch (e) {
+    lines.push(`確認できなかった: ${e.message}`);
+  } finally {
+    for (const srv of [first, second, third]) if (srv) srv.kill();
+    foreign.close();
+  }
+  return lines;
+}
+
 async function post(event) {
   const res = await fetch(`${BASE}/event`, {
     method: 'POST',
@@ -699,6 +760,10 @@ async function main() {
     // **色違いのプロジェクトを並べた使い捨てサーバー**で確かめる
     console.log('--- CLAUDE.md の色の書き方(3 / 4 / 6 / 8 桁)---');
     for (const line of await checkProjectColor()) console.log(`  ${line}`);
+    // 起動時の入れ替え(takeover.js)。同じポートでもう 1 台起動すると前のサーバーが
+    // 終了して入れ替わり、別のアプリのポートでは何も止めずに終わること
+    console.log('--- 起動時の入れ替え(同じポートで 2 回起動する)---');
+    for (const line of await checkTakeover()) console.log(`  ${line}`);
     console.log(`完了。ブラウザ(${BASE})でキャラクターの動きを確認してください。`);
   } catch (e) {
     console.error('送信失敗: サーバーが起動していません。先に `npm start` を実行してください。');

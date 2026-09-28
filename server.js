@@ -6,11 +6,13 @@
  * - GET /            : public/ の静的ファイル配信
  * - POST /event      : report.js からの Hook イベント受信
  * - GET /state       : 現在のエージェント状態(デバッグ用)
+ * - POST /shutdown   : 新しく起動したサーバーからの入れ替えの依頼(takeover.js)
  * - WebSocket        : 状態変化を全クライアントへブロードキャスト
  * - 全経路で Host を、WebSocket と POST /event では Origin も検査する
  *   (別サイトのページから読まれない・送り込まれないように。「アクセス制御」の節)
  * - 全 HTTP 応答に nosniff を、ビューアーの HTML には CSP を付ける
  *   (「セキュリティヘッダ」の節。#82)
+ * - 同じポートで前のサーバーが動いていたら、終了を頼んで入れ替わる(takeover.js)
  *
  * 設定の優先順位: コマンド引数 > 実際の環境変数 > .env > 既定値
  *
@@ -22,6 +24,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
+const takeover = require('./takeover');
 
 // 他のどの設定読み取りよりも先に .env を process.env へ反映する
 const loadEnv = require('./load-env');
@@ -2412,6 +2415,11 @@ function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === takeover.SHUTDOWN_PATH) {
+    handleShutdown(req, res);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/state') {
     // 本文を先に作る(writeHead のあとで例外が出ると、外側で 500 を返せない)
     const body = JSON.stringify(JSON.parse(stateMessage()), null, 2);
@@ -2426,6 +2434,29 @@ function handleRequest(req, res) {
   }
 
   res.writeHead(405).end();
+}
+
+// 新しく起動したサーバーからの入れ替えの依頼(takeover.js)。応答を返してから終了する。
+// **ブラウザからは受けない**: Origin が付いていれば自オリジンでも 403(ビューアーの
+// ページはこれを使わない。ブラウザは別サイトからの POST に必ず Origin を付ける)。
+// 加えて /event と同じく application/json 以外は 415(preflight が要る形に限る)
+function handleShutdown(req, res) {
+  req.resume(); // 本文は使わない
+  if (req.headers.origin !== undefined) {
+    sendJson(res, 403, { ok: false, error: 'forbidden origin' });
+    return;
+  }
+  if (mediaType(req.headers['content-type']) !== 'application/json') {
+    sendJson(res, 415, { ok: false, error: 'content-type must be application/json' });
+    return;
+  }
+  // 応答を書き終えたら(相手が先に切っても)終了する。状態はメモリだけなので
+  // 残す後始末は無い。ビューアーのタブは 3 秒ごとの再接続で新しいサーバーへ繋がる。
+  // ログは書き終えてから終了する(stdout がパイプだと非同期になる OS がある)
+  res.on('close', () => {
+    process.stdout.write('新しく起動したサーバーと入れ替えるため終了します\n', () => process.exit(0));
+  });
+  sendJson(res, 200, takeover.shutdownReply());
 }
 
 function serveStatic(pathname, res) {
@@ -2576,6 +2607,14 @@ function broadcast() {
     if (client.readyState === 1 /* OPEN */) client.send(msg);
   }
 }
+
+// ws は HTTP サーバーの 'error' を自分にも写す。受け手が居ないとその場で例外になり
+// サーバーごと落ちる(ポートの使用中がスタックトレースで落ちていたのはこれ)。
+// 待ち受け前のもの(EADDRINUSE など)は takeover.js が server 側で扱うので、
+// ここでは待ち受け後のもの(接続の受け付けの失敗)だけログへ出す
+wss.on('error', (e) => {
+  if (server.listening) console.error('サーバーでエラーが発生しました:', e);
+});
 
 wss.on('connection', (ws) => {
   // 不正なフレームや maxPayload 超えのメッセージでは、ws が接続に 'error' を出す。
@@ -2780,11 +2819,16 @@ setInterval(() => {
   }
 }, SWEEP_MS).unref();
 
-server.listen(PORT, HOST, () => {
-  if (loadedEnvKeys.length > 0) {
-    console.log(`.env を読み込みました: ${loadedEnvKeys.join(', ')}`);
-  }
-  console.log(`Claude Virtual Agents server: http://${HOST}:${PORT}`);
-  if (BOSS_NAME) console.log(`メインエージェントの呼び名: ${BOSS_NAME}`);
-  console.log('ブラウザで上記 URL を開き、Claude Code でタスクを実行してください。');
+// ポートが使用中なら、起動中のこのアプリに終了を頼んで入れ替わる(takeover.js)
+takeover.listen(server, {
+  port: PORT,
+  host: HOST,
+  onListening: () => {
+    if (loadedEnvKeys.length > 0) {
+      console.log(`.env を読み込みました: ${loadedEnvKeys.join(', ')}`);
+    }
+    console.log(`Claude Virtual Agents server: http://${HOST}:${PORT}`);
+    if (BOSS_NAME) console.log(`メインエージェントの呼び名: ${BOSS_NAME}`);
+    console.log('ブラウザで上記 URL を開き、Claude Code でタスクを実行してください。');
+  },
 });
