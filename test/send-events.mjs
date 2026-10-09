@@ -710,6 +710,193 @@ async function checkTakeover() {
   return lines;
 }
 
+// ---- 要約用の分岐(AgentSummary)を入室させない --------------------------------
+//
+// Claude Code 本体は、実行中のバックグラウンドのサブの会話を分岐させて行動を要約させる
+// ことがある。分岐がツールを呼ぶと PreToolUse が **新しい agent_id・空の agent_type** で
+// 届くが、分岐はサブ専用トランスクリプトを残さない。これを取りこぼしたサブとして
+// 入室させると名札が sub-N のまま居残るので、サーバーは
+// 「agent_type が空 + サブ専用ファイルが無い」イベントでは体を作らない。見るのは:
+//   ・分岐の PreToolUse で在室サブが増えない / Task で入れた仮キャラを引き取らない
+//   ・分岐の SubagentStop で作業報告が出ず、充電中のボスも呼び戻されない
+//   ・比較: agent_type が空でもサブ専用ファイルがあれば従来どおり(仮キャラを引き取る)。
+//     transcript_path が無くて場所を決められないときも従来どおり入室する
+//   ・SubagentStart は判定の対象外: agent_type が空でサブ専用ファイルが無くても入室する
+//   ・見送った agent_id は覚えない: あとでサブ専用ファイルを作って同じ ID で送ると入室する
+// 手順ごとに agent_id を分けてある(前の手順の残りが、あとの手順の NG の原因にならないように)。
+// 在室サブの数やツール回数は、絶対値ではなく **直前の手順との差**で判定する
+// ボスの呼び戻し(#66)は充電中のときだけ起きるので、#66 と同じく **`--idle=3` の
+// 使い捨てサーバー**で確かめる。サブ専用ファイルの置き方は #23 の模擬トランスクリプトに
+// 合わせ、後片付けも同じ cleanupTranscripts(TMP_DIR ごと消す)に任せる。
+// **ポートは 3893** —— 3895 / 3894 は入れ替え、3896 は色、3897 は #70、3898 は #66、
+// 3899 は verify.mjs が使う
+const FORK_PORT = 3893;
+const FORK_BASE = `http://127.0.0.1:${FORK_PORT}`;
+
+async function checkSummaryFork() {
+  const sid = 'e2e-fork-session';
+  const tx = path.join(TMP_DIR, `${sid}.jsonl`);
+  const subDir = path.join(TMP_DIR, sid, 'subagents');
+  // 分岐。サブ専用ファイルは **作らない**。手順 1 は仮キャラなし、手順 3 / 4 は仮キャラありで別の ID
+  const FORK_BARE_ID = 'e2eforkbare0000001';
+  const FORK_TASK_ID = 'e2eforktask0000001';
+  const TYPELESS_ID = 'e2etypelesssub0001'; // agent_type は空だがサブ専用ファイルがある
+  const NOPATH_ID = 'e2enopathsub000001';   // transcript_path を伴わない
+  const START_ID = 'e2estartnofile00001';   // SubagentStart。agent_type は空でファイルも無い
+  const LATE_ID = 'e2elatefile000000001';   // 一度見送られ、あとでサブ専用ファイルができる
+  fs.writeFileSync(tx, jsonl([
+    { type: 'assistant', sessionId: sid, isSidechain: false, message: { model: 'claude-opus-5', usage: { input_tokens: 3, output_tokens: 5 } } },
+  ]));
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(subDir, `agent-${TYPELESS_ID}.jsonl`),
+    jsonl([
+      { agentId: TYPELESS_ID, isSidechain: true, type: 'user', message: { role: 'user' } },
+    ])
+  );
+  const srv = spawn(process.execPath, [path.join(REPO, 'server.js'), '--idle=3'], {
+    env: Object.assign({}, process.env, { CVA_PORT: String(FORK_PORT) }),
+    stdio: 'ignore',
+  });
+  const lines = [];
+  const snap = async () => (await (await fetch(`${FORK_BASE}/state`)).json());
+  const subsOf = (st) => Object.values(st.agents).filter((a) => !a.isMain);
+  const reportsOf = (st) => (st.stats.reports || []).length;
+  // 分岐のイベント。実測の形(sub-6 の例)に合わせ、エフォートとコマンドは載るが agent_type は空
+  const fork = (hookEventName, agentId, extra) => Object.assign({
+    session_id: sid, hook_event_name: hookEventName, agent_id: agentId, agent_type: '',
+    transcript_path: tx,
+  }, extra || {});
+  const forkTool = (hookEventName, agentId) => fork(hookEventName, agentId, {
+    tool_name: 'Bash', tool_input: 'いまの行動を確かめる', tool_command: 'date +%s', effort: 'medium',
+  });
+  // 在室サブの { キー: ツール回数 }。手順の前後で比べる
+  const toolsOf = (st) => Object.fromEntries(Object.entries(st.agents)
+    .filter(([, a]) => !a.isMain).map(([k, a]) => [k, a.toolCount || 0]));
+  const sumOf = (t) => Object.values(t).reduce((s, v) => s + v, 0);
+  const sameTools = (a, b) => Object.keys(a).length === Object.keys(b).length
+    && Object.keys(a).every((k) => a[k] === b[k]);
+  const show = (t) => Object.values(t).join(',') || '-';
+  const send = async (event) => {
+    await postTo(FORK_BASE, event);
+    await sleep(300);
+    return snap();
+  };
+  const ng = (ok) => (ok ? '' : ' ← NG');
+  try {
+    for (let i = 0; i < 25; i++) {
+      try { await snap(); break; } catch (e) { await sleep(200); }
+    }
+    await postTo(FORK_BASE, {
+      session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: 'DESIGN.md',
+      transcript_path: tx,
+    });
+    // 1) 仮キャラが居ないときの分岐。旧実装はここで sub-N を入室させていた
+    let st = await send(forkTool('PreToolUse', FORK_BARE_ID));
+    let n = subsOf(st).length;
+    lines.push(`分岐の PreToolUse(仮キャラなし): 在室サブ ${n} 体(期待値 0 体)${ng(n === 0)}`);
+
+    // 2) Task で仮キャラを入れてから、ボスが充電に入るまで待つ(#66 と同じ手順)
+    await postTo(FORK_BASE, {
+      session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Task',
+      tool_input: '調査を依頼', subagent_type: 'planner', transcript_path: tx,
+    });
+    let charging = null;
+    for (let i = 0; i < 40; i++) {
+      await sleep(300);
+      const m = (await snap()).agents.main;
+      if (m && m.action === 'resting') { charging = m; break; }
+    }
+    lines.push(charging
+      ? `充電に入った: ${charging.room} / ${charging.action}`
+      : '充電に入らなかった — この先の確認は成立していない ← NG');
+    if (!charging) return lines;
+
+    // 3) 仮キャラが居るときの分岐。引き取られると仮キャラのツール回数が 1 に増える。
+    //    手順 1 の ID とは別の ID を使い、送る前の状態との差で見る
+    let prev = toolsOf(await snap());
+    await postTo(FORK_BASE, forkTool('PreToolUse', FORK_TASK_ID));
+    st = await send(forkTool('PostToolUse', FORK_TASK_ID));
+    let cur = toolsOf(st);
+    lines.push(`分岐の PreToolUse / PostToolUse(仮キャラあり): 在室サブ ${Object.keys(cur).length} 体 / ツール回数 ${show(cur)}`
+      + `(期待値 ${Object.keys(prev).length} 体 / ${show(prev)} = 増えず、仮キャラも引き取らない)${ng(sameTools(prev, cur))}`);
+
+    // 4) 手順 3 の分岐の SubagentStop。作業報告も、充電中のボスの呼び戻しも起きない
+    st = await send(fork('SubagentStop', FORK_TASK_ID));
+    let m = st.agents.main;
+    let r = reportsOf(st);
+    let nowSubs = subsOf(st).length;
+    lines.push(`分岐の SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action} / 在室サブ ${nowSubs} 体`
+      + `(期待値 0 件 / lounge / resting / ${Object.keys(prev).length} 体)`
+      + ng(r === 0 && m.room === 'lounge' && m.action === 'resting' && nowSubs === Object.keys(prev).length));
+    cur = toolsOf(st); // 次の手順の比較元(手順 4 が崩れていても、その状態を起点にする)
+
+    // 5) 比較: agent_type が空でもサブ専用ファイルがあれば従来どおり。仮キャラを引き取る
+    st = await send({
+      session_id: sid, hook_event_name: 'PreToolUse', agent_id: TYPELESS_ID, agent_type: '',
+      tool_name: 'Read', tool_input: 'server.js', transcript_path: tx,
+    });
+    prev = cur;
+    cur = toolsOf(st);
+    const adopted = Object.keys(cur).length === Object.keys(prev).length && sumOf(cur) === sumOf(prev) + 1;
+    lines.push(`種類が空・サブ専用ファイルあり: 在室サブ ${Object.keys(cur).length} 体 / ツール回数 ${show(cur)}`
+      + `(期待値 ${Object.keys(prev).length} 体 / ツール回数の合計 +1 = 従来どおり仮キャラを引き取る)${ng(adopted)}`);
+
+    // 6) 比較: transcript_path が無いと場所を決められないので、従来どおり入室させる
+    st = await send({
+      session_id: sid, hook_event_name: 'PreToolUse', agent_id: NOPATH_ID, agent_type: '',
+      tool_name: 'Read', tool_input: 'README.md',
+    });
+    prev = cur;
+    cur = toolsOf(st);
+    n = Object.keys(cur).length;
+    lines.push(`種類が空・transcript_path なし: 在室サブ ${n} 体(期待値 ${Object.keys(prev).length + 1} 体 = 従来どおり入室)`
+      + ng(n === Object.keys(prev).length + 1));
+
+    // 7) 比較: 本物の SubagentStop なら作業報告が出て、ボスが司令席へ呼び戻される。
+    //    4) の「起きない」が、確かめようの無い空振りではないことをここで示す
+    st = await send({
+      session_id: sid, hook_event_name: 'SubagentStop', agent_id: TYPELESS_ID, agent_type: '',
+      transcript_path: tx,
+    });
+    m = st.agents.main;
+    r = reportsOf(st);
+    lines.push(`サブ専用ファイルありの SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action}`
+      + `(期待値 1 件 / desk / idle)${ng(r === 1 && m.room === 'desk' && m.action === 'idle')}`);
+
+    // 8) 比較: SubagentStart は判定の対象外。agent_type が空でサブ専用ファイルが無くても、
+    //    実在のサブの開始通知なので従来どおり入室する(この時点で未紐付けの仮キャラは居ない)。
+    //    手順 7 で報告に立ったサブは 6 秒ほど在室のまま残るので、数は手順 7 の直後との差で見る
+    prev = toolsOf(st);
+    st = await send(fork('SubagentStart', START_ID));
+    n = subsOf(st).length;
+    lines.push(`種類が空・サブ専用ファイル無しの SubagentStart: 在室サブ ${n} 体`
+      + `(期待値 ${Object.keys(prev).length + 1} 体 = 従来どおり入室)${ng(n === Object.keys(prev).length + 1)}`);
+
+    // 9) 見送った agent_id は覚えない。一度見送られた ID でも、あとでサブ専用ファイルを
+    //    作ってから同じ ID のイベントを送ると、普通に入室する
+    const baseN = n;
+    st = await send(forkTool('PreToolUse', LATE_ID));
+    const skipped = subsOf(st).length;
+    fs.writeFileSync(
+      path.join(subDir, `agent-${LATE_ID}.jsonl`),
+      jsonl([
+        { agentId: LATE_ID, isSidechain: true, type: 'user', message: { role: 'user' } },
+      ])
+    );
+    st = await send(forkTool('PreToolUse', LATE_ID));
+    const entered = subsOf(st).length;
+    lines.push(`見送ったあとでサブ専用ファイルを作る: 見送り時 ${skipped} 体 → 作成後 ${entered} 体`
+      + `(期待値 ${baseN} 体 → ${baseN + 1} 体 = 見送った ID を覚えていない)`
+      + ng(skipped === baseN && entered === baseN + 1));
+  } catch (e) {
+    lines.push(`確認できなかった: ${e.message} ← NG`);
+  } finally {
+    srv.kill();
+  }
+  return lines;
+}
+
 async function post(event) {
   const res = await fetch(`${BASE}/event`, {
     method: 'POST',
@@ -764,6 +951,11 @@ async function main() {
     // 終了して入れ替わり、別のアプリのポートでは何も止めずに終わること
     console.log('--- 起動時の入れ替え(同じポートで 2 回起動する)---');
     for (const line of await checkTakeover()) console.log(`  ${line}`);
+    // 要約用の分岐(AgentSummary)。agent_type が空でサブ専用ファイルも無いイベントでは
+    // 体を作らず、作業報告もボスの呼び戻しも起きないこと。充電中のボスを使うので、
+    // #66 と同じく --idle=3 の使い捨てサーバーで確かめる
+    console.log('--- 要約用の分岐を入室させない(agent_type が空 + サブ専用ファイル無し)---');
+    for (const line of await checkSummaryFork()) console.log(`  ${line}`);
     console.log(`完了。ブラウザ(${BASE})でキャラクターの動きを確認してください。`);
   } catch (e) {
     console.error('送信失敗: サーバーが起動していません。先に `npm start` を実行してください。');

@@ -1825,9 +1825,43 @@ function adoptUnboundSub(sessionId) {
   return '';
 }
 
+// 要約用の分岐(AgentSummary)が送るイベントか。
+// Claude Code 本体は、実行中のバックグラウンドのサブの会話を分岐させて、いまの行動を
+// 短く要約させることがある。分岐がツールを呼ぶと(権限で拒否されて実行はされないが)
+// PreToolUse の Hook はその前に発火し、**分岐自身の新しい agent_id・空の agent_type** で
+// 届く。取りこぼしたサブとして入室させると名札は sub-N のまま決まらず、分岐は
+// サブ専用トランスクリプトを残さず SubagentStop も来ないことがあるので、セッションが
+// 終わるまで居残る。次の **全部** を満たすときだけ分岐とみなす:
+//   ・agent_id がまだどの体にも紐付いていない
+//   ・agent_type が空。実在のサブでもファイルの書き出しが Hook より遅れることがあるので、
+//     ファイルの有無だけでは決めない
+//   ・Hook の transcript_path からサブ専用トランスクリプトの場所を決められて、そこに
+//     ファイルが無い。場所を決められないとき(transcript_path が無いなど)は見分けられない
+//     ので従来どおり入室させる(消し間違えるより残す。DESIGN.md 4.2)
+// SubagentStart は実在のサブの開始通知なので対象にしない(この時点ではまだファイルが
+// 無いのが普通)。見送った agent_id は覚えない — あとでファイルが現れれば、次の
+// イベントで普通に入室できる
+function isSummaryForkEvent(ev) {
+  if (ev.hook_event_name === 'SubagentStart' || ev.agent_type) return false;
+  const agentId = String(ev.agent_id || '');
+  const known = agentId && subKeyByAgentId.get(agentId);
+  if (!agentId || (known && agents[known])) return false;
+  const file = subTranscriptPath(agentId, ev.transcript_path);
+  if (!file) return false;
+  try {
+    fs.statSync(file); // stat は 1 ファイルだけ(defStale の statSync と同じ)
+    return false;
+  } catch (e) {
+    // 「無い」と言い切れるときだけ。読めない理由が別(権限など)なら従来どおり入室させる
+    return !!e && e.code === 'ENOENT';
+  }
+}
+
 // agent_id を持つイベントの宛先エージェントを返す。
 // Task の PreToolUse で先に入室させたキャラがいれば、それを結びつけて再利用する
-// (別キャラとして入れ直すと、同じサブエージェントが退室 → 入室したように見えるため)
+// (別キャラとして入れ直すと、同じサブエージェントが退室 → 入室したように見えるため)。
+// 要約用の分岐(isSummaryForkEvent)のイベントは体を作らず、仮キャラにも引き取らせずに
+// null を返す(呼び出し側は在室の上限のときと同じく、そのサブへの反映を飛ばす)
 function subForAgentId(ev, now) {
   const agentId = ev.agent_id;
   const known = subKeyByAgentId.get(agentId);
@@ -1835,6 +1869,7 @@ function subForAgentId(ev, now) {
     noteAgentCtx(known, ev); // 後続イベントで cwd / transcript が届いたら控え直す(#41 / #42)
     return agents[known];
   }
+  if (isSummaryForkEvent(ev)) return null;
 
   const adopt = adoptUnboundSub(ev.session_id);
   if (adopt && agents[adopt]) {
@@ -2086,7 +2121,7 @@ function handleEvent(ev) {
     case 'PreToolUse': {
       if (isSubEvent) {
         // サブエージェントが実行したツール → そのサブエージェントを動かす
-        // (在室の上限で入室させられなかったときは何もしない)
+        // (在室の上限で入室させられなかったとき・要約用の分岐のイベントは何もしない)
         const target = subForAgentId(ev, now);
         if (target) {
           const m = mapTool(toolName, ev.tool_input, ev.tool_command);
@@ -2124,7 +2159,7 @@ function handleEvent(ev) {
     case 'PostToolUse': {
       // 質問待ち(#44)が解けるのはここ。イベントの宛先(サブなら本人)だけを戻す
       const target = isSubEvent ? subForAgentId(ev, now) : main;
-      if (target) { // 在室の上限で入室させられなかったサブは飛ばす
+      if (target) { // 在室の上限で入室させられなかったサブ・要約用の分岐は飛ばす
         clearAsking(target);
         target.updatedAt = now;
       }
@@ -2146,7 +2181,9 @@ function handleEvent(ev) {
       let key = '';
       if (goneId) {
         // 紐付いていればその体だけ。**紐付いていなければ誰も退室させない** —
-        // このビューアーが一度も見ていないサブなので、消す相手を推測する根拠が無い
+        // このビューアーが一度も見ていないサブなので、消す相手を推測する根拠が無い。
+        // 要約用の分岐(isSummaryForkEvent)は紐付けないので、その SubagentStop も
+        // ここで止まる(作業報告もボスの呼び戻しも起きない)
         key = subKeyByAgentId.get(goneId) || '';
         subKeyByAgentId.delete(goneId);
       } else {
@@ -2238,7 +2275,7 @@ function handleEvent(ev) {
     default:
       if (isSubEvent) {
         const target = subForAgentId(ev, now);
-        if (target) target.updatedAt = now; // 在室の上限なら null
+        if (target) target.updatedAt = now; // 在室の上限・要約用の分岐なら null
       }
       main.updatedAt = now;
       break;
