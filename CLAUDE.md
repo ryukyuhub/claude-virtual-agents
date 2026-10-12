@@ -1,67 +1,3 @@
-# CLAUDE.md
-
-コミットメッセージ・コード内コメント・ドキュメントは日本語で書く(既存に合わせる)。
-
-## プロジェクト概要
-
-Claude Code のセッション(メインエージェント + サブエージェント)の動作を、キャラクターが動く2Dアニメーションでリアルタイム可視化するローカルビューアー。メイン = ボス、サブ = 社員というメタファー。
-
-設計の詳細は [DESIGN.md](./DESIGN.md)、利用者向け手順は [README.md](./README.md)。**仕様を変えたらこの2つも更新する。**
-
-文中の `#数字`(DESIGN.md やコードのコメント)は公開前のリポジトリの Issue 番号で、このリポジトリの Issue とは対応しない。経緯は DESIGN.md の本文を正とする。
-
-## コマンド
-
-
-| コマンド                             | 用途                                                     |
-| -------------------------------- | ------------------------------------------------------ |
-| `npm start`                      | サーバー起動([http://127.0.0.1:3777](http://127.0.0.1:3777)) |
-| `npm run test:events`            | 実 Hook と同形式のイベントを POST(**サーバー起動中に実行**)                 |
-| `npm run build:artifact`         | `preview/` の自己完結 HTML を再生成                             |
-| `npm run setup-hooks`            | `~/.claude/settings.json` に Hooks を追記(`--remove` で削除)。利用者のグローバル設定を書き換えるので、頼まれない限り実行しない |
-| `npm run verify` / `verify:full` | 実ブラウザでの見た目検証(クイック / フル)                                |
-
-
-テストランナーは無い。動作確認は3系統 — **ロジック**(`test:events` → `/state` の JSON を見る)/ **見た目**(`build:artifact` → `preview/artifact-preview.html`、または `/?mock=1`)/ **レイアウト**(`npm run verify`)。verify は使い捨てのスクリプトを書き直さず既存のハーネスを使う。回避してある罠は [test/verify.mjs](test/verify.mjs) と [test/verify-harness.html](test/verify-harness.html) の冒頭コメントにある。verify はブラウザが見つからないと検証せずに成功扱いで終わるので、出力に「合計 N 件 / 失敗 N 件」の行があるかで判断する。
-
-## Git
-
-コミットメッセージは `feat:` / `fix:` / `docs:` / `test:` / `chore:` のいずれかで始め、要約は日本語で 1 行にする。理由は本文に書く。
-
-## アーキテクチャ
-
-```
-Claude Code ──Hooks──> report.js ──POST /event──> server.js ──WebSocket──> ブラウザ(PixiJS)
-```
-
-3層とも**片方向**。ブラウザからサーバーへは何も送らない(見るだけのビューアー)。
-
-- **report.js** — Hook の JSON を要約して POST するだけ。タイムアウト・強制 exit・エラー全握りつぶしで**必ず exit 0**。この非侵襲性は絶対に壊さない
-- **server.js** — 状態はメモリ保持のみ。イベントの宛先は `agent_id` で決まる。モデル / 名札 / トークンは**サーバーがトランスクリプトを読んで解決する**(`report.js` には持ち込まない)。解決順と落とし穴は DESIGN.md 4.2
-- **public/** — レンダラーはイベントソースから疎結合(`adapters.js` の WebSocketAdapter / MockAdapter が同一インターフェース)
-
-### レンダラーの契約
-
-`office.js`(オフィスモード)と `remote.js`(リモートモード)は同一インターフェースを実装する。新しいモードもこれに合わせる:
-
-```js
-CVA.createXxxRenderer(container, opts) -> { applyState(agents, stats?), setMainLabel(name), destroy() }
-```
-
-- 描画の共通部品は `character.js` の `CVA.charKit`。**キャラの見た目は charKit を直せば両モードに効く**
-- アバターは主副とも球体マスコット「ハロ」(ボスだけが手足を持つ)。**寸法は両レンダラーの配置計算の前提**なので、変えたら office の `SLOT_OFFSETS` と remote の `gridFor()` / `BUST` を解き直す
-- 論理座標系は不変。画面サイズへの追従は解像度で行い、**`stage.scale` は 1 固定**
-- **一度消した仕組みは戻さない**(共有画面・状況一覧・全体ログ・掲示板の横並び / ページ送り・人型ロボ・耳の輪郭線・持ち物の小道具ほか)。理由と実測値は DESIGN.md 4.5 / 4.9 / 4.10 にあるので、**描画を触る前に読む**
-
-## 守るべき制約
-
-1. **クロスプラットフォーム**: 動作対象は Windows ネイティブ + macOS。補助スクリプトは `.mjs` で書き(`.sh` / `.bat` / `.ps1` を作らない)、パス操作は `node:path` / `os.homedir()` 経由のみ
-2. **`localhost` ではなく `127.0.0.1`** と明示する(Windows の IPv6 解決対策)
-3. **依存を増やさない**: Node.js 標準ライブラリ + `ws` のみ。PixiJS は vendoring 済み(CDN 参照しない)
-4. **外部通信なし・永続化なし**: bind は `127.0.0.1` のみ、状態はメモリのみ
-5. **`preview/*.html` は生成物**: 直接編集せず `public/` を直して `build:artifact` で再生成し、生成物ごとコミットする(単一 HTML 自己完結・外部読み込み / fetch 禁止)
-6. **`public/index.html` にインラインの記述を書かない**: ビューアーの HTML は CSP の下で動くので、中身のある `<script>`・`<style>`・`on*=`・`style=` 属性は止まり、画面が真っ白になる。スクリプトは `public/app.js`、スタイルは `public/style.css` へ。`npm run verify` の静的検査で見張っているが、verify は server.js を通らないので CSP 違反そのものは実ブラウザで確かめる(DESIGN.md 4.2)
-
 ## カスタムエージェント
 
 `.claude/agents/` に役割別の定義がある。出力が長い / 手順が決まっている / 並列にできる作業は委譲してよい。このリポジトリはサブエージェントの動きを見るツールなので、委譲すればビューアーでそのまま動作を確かめられる。
@@ -94,14 +30,11 @@ CVA.createXxxRenderer(container, opts) -> { applyState(agents, stats?), setMainL
 
 ### 同時実行数
 
-同時に動かすサブエージェントは3つまで。
+同時に動かすサブエージェントは、`.env` の `MAX_PARALLEL_SUBAGENTS` の値までとするが、その定数が無い場合は3とする。
 
-## ビューアーの表示設定
-
-下のブロックはこのアプリ自身の機能の実例で、Claude Code への指示ではない。このリポジトリで作業するボスの機体色と呼び名になる(README「プロジェクトごとに色と呼び名を決める」、DESIGN.md 4.24)。`color` の 8 桁(アルファ付き)は DESIGN.md 4.24 が実例として参照しているので変えない。
+### Claude Virtual Agents
 
 ```cva
 color: #c9ea0cff
 name: ClaudeAgents
 ```
-
