@@ -950,6 +950,10 @@ const KIND_CASES = [
   ['gh run list --limit 5', INSPECT, 'gh run list'],
   ['gh api repos/o/r/pulls', INSPECT, 'gh api(GET)'],
   ['docker -H tcp://10.0.0.5:2375 ps -a', INSPECT, 'docker -H ps'],
+  ["ssh web01 'uptime  # check load'", INSPECT, '語の頭の # はコメント'],
+  ['ssh web01 "sed -n \'/ERROR/,+3p\' /var/log/app.log"', INSPECT, 'sed の番地と p'],
+  ["ssh web01 'LANG=C GIT_PAGER=cat git -C /srv/app log -3'", INSPECT, '表にある変数代入'],
+  ["ssh web01 'tree -L 2 /srv/app'", INSPECT, 'tree(-o / -R なし)'],
   ['ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"', WORK, 'ssh の中の git pull(司令席ではない)'],
   ["ssh web01 'sudo systemctl restart nginx'", WORK, 'sudo は常に作業'],
   ['ssh web01', WORK, '対話ログイン'],
@@ -973,6 +977,23 @@ const KIND_CASES = [
   ["ssh web01 'mytool --flag'", WORK, '表に無いコマンド'],
   ["ssh web01 'cat app.log", WORK, '閉じていない引用符'],
   [LONG_CMD, WORK, `${LONG_CMD.length} 文字(切れているかもしれない)`],
+  // レビューで見つけた「書き換えるのに調査になっていた」書き方
+  ["cat ~/.ssh/config  # host's alias\nssh prod sudo systemctl restart app  # it's restarted", WORK,
+    'コメントの \' が次の行を飲み込まない'],
+  ['ssh h "sed -n \'1w /tmp/o\' /etc/passwd"', WORK, 'sed の番地つきの w'],
+  ['ssh h "sed -e\'w /tmp/o\' /etc/passwd"', WORK, 'sed の -e にくっつけた w'],
+  ['ssh h "sed \'1e touch x\' f"', WORK, 'sed の e(実行)'],
+  ['ssh h tree -o /etc/out', WORK, 'tree -o'],
+  ['ssh h xxd /etc/a /etc/b', WORK, 'xxd の出力ファイル'],
+  ['ssh h less -o /tmp/log f', WORK, 'less -o'],
+  ['ssh h git diff --output=/etc/x', WORK, 'git diff --output'],
+  ['ssh h date -us 2020-01-01', WORK, 'date -us(まとめた -s)'],
+  ['kubectl cluster-info dump --output-directory /tmp/d', WORK, 'kubectl cluster-info dump --output-directory'],
+  ["ssh h 'GIT_EXTERNAL_DIFF=/tmp/x.sh git diff'", WORK, '表に無い変数代入'],
+  ["ssh h 'git -c core.pager=/tmp/x log'", WORK, 'git -c'],
+  ["ssh h 'cat /var/log/app.log >&2025.log'", WORK, '>& の後ろが数字で始まるファイル名'],
+  ["ssh h echo $'\\x3b' rm -rf /x", WORK, "$'…'(ANSI-C の引用)"],
+  ["ssh -o PermitLocalCommand=yes -o LocalCommand='rm x' h cat f", WORK, 'ssh -o LocalCommand'],
   // ローカルのコマンドは今までどおり
   ['git commit -m "fix: x"', 'desk / git', '手元の git commit'],
   ['git log --oneline -5', 'desk / git', '手元の git log(見るだけでも司令席)'],
@@ -1136,12 +1157,83 @@ async function checkWaitFlow() {
     await sleep(3000);
     await expect('もう 1 体のボス(A の Stop のあと 3 秒無音)', 'workshop / terminal', B);
 
-    // 5. ESC(何も来ない)。開いたままのツールは上限(--idle=1 なので 10 秒)で解ける
+    // 5. 報告と応答完了が入れ違う経路(レビューで見つけたもの)。報告は 6 秒なので、
+    // 終わった瞬間(待機に入る)から充電(1 秒後)までのあいだで覗く
+    const reportEnd = (t0) => sleep(Math.max(0, t0 + 6300 - Date.now()));
+    const startSub = async (id) => {
+      await send({ hook_event_name: 'PreToolUse', tool_name: 'Task', tool_input: '調査を依頼', subagent_type: 'planner' });
+      await send({ hook_event_name: 'SubagentStart', tool_input: '調査を依頼', agent_id: id, agent_type: 'planner' });
+      await send({ hook_event_name: 'PostToolUse', tool_name: 'Task', tool_input: '調査を依頼' });
+    };
+    const isReceiving = async (label) => {
+      const r = bossOf(await snap(), A);
+      const ok = r.room === 'desk' && r.action === 'idle' && / の報告を受けています$/.test(r.task || '');
+      n++;
+      if (!ok) ng++;
+      lines.push(`${ok ? 'OK' : 'NG'}  ${label}: ${r.room} / ${r.action} / ${r.task}`
+        + '(期待値 desk / idle / 〜 の報告を受けています)');
+    };
+    // 5-1. 2 体のうち 1 体が報告を終えた。もう 1 体は働いているので「サブの報告待ち」に戻る
+    const S1 = 'e2ewaitsub00000002';
+    const S2 = 'e2ewaitsub00000003';
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await startSub(S1);
+    await startSub(S2);
+    await send({ hook_event_name: 'Stop' });
+    await tool('PreToolUse', { agent_id: S2, agent_type: 'planner' });
+    await send({ hook_event_name: 'SubagentStop', agent_id: S1 });
+    let t0 = Date.now();
+    await isReceiving('1 体目の報告');
+    await reportEnd(t0);
+    await expect('1 体目の報告が終わった(もう 1 体は働いている)', 'desk / idle / サブの報告待ち');
+    await tool('PostToolUse', { agent_id: S2, agent_type: 'planner' });
+    await send({ hook_event_name: 'SubagentStop', agent_id: S2 });
+    t0 = Date.now();
+    await reportEnd(t0);
+    await expect('2 体目の報告も終わった', 'lounge / idle / 待機中');
+    // 5-2. ボスの作業中にサブが報告に来た(呼び戻せない)。応答完了で司令席へ報告を受けに行く
+    const S3 = 'e2ewaitsub00000004';
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await startSub(S3);
+    await tool('PreToolUse');
+    await send({ hook_event_name: 'SubagentStop', agent_id: S3 });
+    t0 = Date.now();
+    await expect('作業中に報告が来た(引きはがさない)', 'workshop / terminal');
+    await tool('PostToolUse');
+    await send({ hook_event_name: 'Stop' });
+    await isReceiving('作業中に来た報告を応答完了のあとで受ける');
+    await reportEnd(t0);
+    await expect('その報告が終わった', 'lounge / idle / 待機中');
+    // 5-3. 報告を受けている最中に作業へ移り、報告が終わる前に応答完了した
+    const S4 = 'e2ewaitsub00000005';
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await startSub(S4);
+    await send({ hook_event_name: 'Stop' });
+    await send({ hook_event_name: 'SubagentStop', agent_id: S4 });
+    t0 = Date.now();
+    await tool('PreToolUse');
+    await tool('PostToolUse');
+    await send({ hook_event_name: 'Stop' });
+    await isReceiving('報告の途中で作業して応答完了(ツールの部屋に残らない)');
+    await reportEnd(t0);
+    await expect('その報告が終わった', 'lounge / idle / 待機中');
+
+    // 6. ESC(何も来ない)。開いたままのツールは上限(--idle=1 なので 10 秒)で解ける。
+    // 同じ 10 秒で、SubagentStop が届かなかったサブ(取り残し)を待つのもやめる
+    //(別のセッション C で並行して見る)
+    const C = 'e2e-wait-c';
+    await send({ session_id: C, hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await send({ session_id: C, hook_event_name: 'PreToolUse', tool_name: 'Task', tool_input: '調査を依頼', subagent_type: 'planner' });
+    await send({ session_id: C, hook_event_name: 'SubagentStart', tool_input: '調査を依頼', agent_id: 'e2ewaitsub00000006', agent_type: 'planner' });
+    await send({ session_id: C, hook_event_name: 'PostToolUse', tool_name: 'Task', tool_input: '調査を依頼' });
+    await send({ session_id: C, hook_event_name: 'Stop' });
     await tool('PreToolUse');
     await sleep(3000);
     await expect('ESC で止めた直後(ツールが開いたまま)', 'workshop / terminal');
+    await expect('取り残しのサブを待っている(3 秒無音)', 'desk / idle / サブの報告待ち', C);
     await sleep(10000);
     await expect('ESC で止めて上限時間が過ぎた', 'lounge / resting');
+    await expect('取り残しのサブが上限時間より長く無音', 'lounge / resting', C);
     lines.push(`待機の場所: ${n} 件中 NG ${ng} 件(期待値 0 件)`);
   } catch (e) {
     lines.push(`確認できなかった: ${e.message} ← NG`);

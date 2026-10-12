@@ -1485,12 +1485,13 @@ function isRemoteInspect(cmd, limit) {
 
 // 1 行ぶんのシェルを判定する。depth は ssh の中へ潜った段数(踏み台越しを弾くため)。
 // **文字列の段階で弾く書き方**: `$(` とバッククォート(コマンド置換)、`<<`(ヒア
-// ドキュメント / ヒアストリング)、`<(` / `>(`(プロセス置換)。引用符の中でも弾く ——
-// ssh へ渡した文字列は **相手側のシェルがもう一度解釈する** ので、手元で引用されて
-// いても向こうでは置換として動く
+// ドキュメント / ヒアストリング)、`<(` / `>(`(プロセス置換)、`$'…'`(ANSI-C の
+// 引用)。引用符の中でも弾く —— ssh へ渡した文字列は **相手側のシェルがもう一度
+// 解釈する** ので、手元で引用されていても向こうでは置換として動く。`$'\x3b'` は
+// 手元のシェルが `;` に戻してから ssh が相手へ渡すので、向こうでは区切りになる
 function inspectLine(text, depth) {
   const s = String(text);
-  if (/\$\(|`|<<|<\(|>\(/.test(s)) return false;
+  if (/\$\(|`|<<|<\(|>\(|\$'/.test(s)) return false;
   const segs = shellSegments(s);
   if (!segs || !segs.length) return false;
   return segs.every((words) => inspectSegment(words, depth));
@@ -1504,7 +1505,8 @@ function inspectLine(text, depth) {
 //   ・書き込みのリダイレクト(`>` / `>>` / `&>` / `>|`)。**/dev/null へ捨てるものと
 //     `N>&M`(複製)だけは許す** —— `2>&1` や `> /dev/null` は調査でもよく付く
 //   ・`<>`(読み書きで開く)
-// 読み込みのリダイレクト(`< file`)は読むだけなので語から外して先へ進む
+// 読み込みのリダイレクト(`< file`)は読むだけなので語から外して先へ進む。
+// 語の頭の `#` から行末まではコメントなので読み飛ばす
 function shellSegments(text) {
   const s = String(text);
   const segs = [];
@@ -1539,6 +1541,16 @@ function shellSegments(text) {
       t += c;
     }
     return { target: t, end: j - 1 };
+  };
+  // `>&` / `<&` の後ろが fd(`2` / `-` / `2-`)なら、その次の位置を返す。fd で
+  // なければ -1。**数字の後ろに語が続くもの(`>&2025.log`)は fd ではなくファイル名**
+  //(bash はそのファイルへ書く)
+  const fdDupEnd = (from) => {
+    let k = from;
+    while (k < s.length && /\d/.test(s[k])) k++;
+    if (s[k] === '-') k++;
+    if (k === from) return -1;
+    return k >= s.length || /[\s;|&<>()]/.test(s[k]) ? k : -1;
   };
   // リダイレクトの直前の数字(`2>` の 2)は語ではなく fd なので捨てる
   const dropFd = () => {
@@ -1575,6 +1587,14 @@ function shellSegments(text) {
       }
       continue;
     }
+    // `#` は **語の頭なら行末までのコメント**(語の途中の `a#b` や `$#` は普通の文字)。
+    // 読まずに進むと、英語のコメントの `'`(it's)が引用符として開き、次の行の
+    // コマンドまで 1 語に飲み込んでしまう
+    if (ch === '#' && !inWord) {
+      const j = s.indexOf('\n', i);
+      i = j < 0 ? s.length : j - 1;
+      continue;
+    }
     if (ch === '\n') { endSeg(); continue; }
     if (/\s/.test(ch)) { endWord(); continue; }
     if (ch === ';' || ch === '(' || ch === ')') { endSeg(); continue; }
@@ -1600,14 +1620,13 @@ function shellSegments(text) {
       let j = i + 1;
       if (s[j] === '>' || s[j] === '|') j++;
       if (s[j] === '&') {
-        // `>&2` / `>&-`(fd の複製・閉じる)は書き込みではない
-        let k = j + 1;
-        while (k < s.length && /\d/.test(s[k])) k++;
-        if (k > j + 1 || s[k] === '-') {
-          i = s[k] === '-' ? k : k - 1;
+        // `>&2` / `>&-` / `>&2-`(fd の複製・閉じる・移す)は書き込みではない
+        const k = fdDupEnd(j + 1);
+        if (k >= 0) {
+          i = k - 1;
           continue;
         }
-        j++; // `>&file`(まとめて file へ)は下で行き先を見る
+        j++; // `>&file`(まとめて file へ)・`>&2025.log` は下で行き先を見る
       }
       const t = readTarget(j);
       if (!t || t.target !== '/dev/null') return null;
@@ -1619,10 +1638,12 @@ function shellSegments(text) {
       dropFd();
       let j = i + 1;
       if (s[j] === '&') {
-        let k = j + 1;
-        while (k < s.length && /[\d-]/.test(s[k])) k++;
-        i = k - 1;
-        continue;
+        const k = fdDupEnd(j + 1);
+        if (k >= 0) {
+          i = k - 1;
+          continue;
+        }
+        j++;
       }
       const t = readTarget(j);
       if (!t) return null;
@@ -1657,23 +1678,50 @@ function positionals(args, withArg) {
 
 // 引数を見ずに「見るだけ」と言い切れるコマンド。**ここに無いコマンドは偽**
 //(作業側へ倒す)。scp / sftp / rsync / sudo / doas / su / tee / xargs は
-// 書き込みや別コマンドの実行に使うので、わざと入れていない
+// 書き込みや別コマンドの実行に使うので、わざと入れていない。
+// 見るだけでも **書き込みのオプションを持つもの**(less / tree / xxd / rg / ss / file)は
+// ここではなく inspectSegment の分岐で引数を見る
 const INSPECT_ANY = new Set([
-  'cat', 'head', 'tail', 'less', 'more', 'grep', 'egrep', 'fgrep', 'zgrep', 'zcat', 'rg',
-  'ls', 'tree', 'wc', 'cut', 'jq', 'stat', 'du', 'df', 'free', 'uptime', 'ps', 'top', 'htop',
+  'cat', 'head', 'tail', 'more', 'grep', 'egrep', 'fgrep', 'zgrep', 'zcat',
+  'ls', 'wc', 'cut', 'jq', 'stat', 'du', 'df', 'free', 'uptime', 'ps', 'top', 'htop',
   'w', 'who', 'whoami', 'id', 'uname', 'pwd', 'echo', 'printf', 'which', 'type', 'lsof',
-  'ss', 'netstat', 'dig', 'nslookup', 'host', 'ping', 'cd', 'sleep', 'true', 'false',
-  'test', '[', 'basename', 'dirname', 'realpath', 'readlink', 'file', 'md5sum', 'sha1sum',
+  'netstat', 'dig', 'nslookup', 'host', 'ping', 'cd', 'sleep', 'true', 'false',
+  'test', '[', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha1sum',
   'sha256sum', 'tac', 'nl', 'column', 'tr', 'diff', 'cmp', 'comm', 'printenv', 'nproc',
-  'lscpu', 'lsblk', 'vmstat', 'iostat', 'last', 'getent', 'groups', 'xxd', 'od',
+  'lscpu', 'lsblk', 'vmstat', 'iostat', 'last', 'getent', 'groups', 'od',
   'hexdump', 'strings',
+]);
+
+// 先頭の変数代入で許すもの。表示や文字コードを変えるだけの変数と、ページャーを
+// 切る指定(`PAGER=cat` / `GIT_PAGER=`)だけ。`GIT_EXTERNAL_DIFF=…` / `LESSOPEN=…` /
+// `LD_PRELOAD=…` / `PATH=…` は後ろのコマンドに別のプログラムを走らせられるので偽
+const SAFE_ASSIGN_RE = /^(?:(?:LANG|LANGUAGE|LC_[A-Z]+|TZ|TERM|COLUMNS|LINES|NO_COLOR)=|(?:PAGER|GIT_PAGER|SYSTEMD_PAGER)=(?:cat)?$)/;
+
+// 短いオプションのまとまり(`-us`)に chars のどれかが入っているか。withArg の文字に
+// 当たったら残りはその値なので見ない。値の中の文字まで拾うことはあるが、作業側へ倒れるだけ
+function shortOpt(args, chars, withArg) {
+  return args.some((a) => {
+    if (!/^-[^-]/.test(a)) return false;
+    for (const c of a.slice(1)) {
+      if (chars.includes(c)) return true;
+      if (withArg && withArg.includes(c)) return false;
+    }
+    return false;
+  });
+}
+
+const XXD_OPT_WITH_ARG = new Set([
+  '-c', '-g', '-l', '-o', '-s', '-n', '-cols', '-groupsize', '-len', '-offset', '-seek', '-name',
 ]);
 
 // 1 つの部分コマンド(語の配列)を判定する
 function inspectSegment(words, depth) {
   let k = 0;
-  // 先頭の変数代入(`LANG=C grep …`)は読み飛ばす。代入だけの部分は何も書き換えない
-  while (k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k])) k++;
+  // 先頭の変数代入(`LANG=C grep …`)は表にあるものだけ読み飛ばす。代入だけの部分も
+  // 同じ —— `PATH=/tmp:$PATH; ls` は後ろの ls を別物に差し替える
+  for (; k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k]); k++) {
+    if (!SAFE_ASSIGN_RE.test(words[k])) return false;
+  }
   if (k >= words.length) return true;
   // パス付き(/usr/bin/tail)や Windows の .exe も同じコマンドとして見る
   const name = String(words[k]).split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
@@ -1696,7 +1744,28 @@ function inspectSegment(words, depth) {
       // `service api status` と `service --status-all` だけ
       return args.includes('--status-all') || positionals(args)[1] === 'status';
     case 'date':
-      return !args.some((a) => /^(-s|--set)/.test(a));
+      // `-s` / `--set` は時計を書き換える。短いオプションはまとめて書ける(`-us`)
+      return !shortOpt(args, 's', 'dfrI') && !args.some((a) => /^--set/.test(a));
+    case 'tree':
+      // `-o file` はファイルへ書き、`-R` は各ディレクトリに `-o 00Tree.html` を足して回る
+      return !shortOpt(args, 'oR') && !args.some((a) => /^--o/.test(a));
+    case 'xxd':
+      // 2 つ目の語は出力先のファイル
+      return positionals(args, XXD_OPT_WITH_ARG).length <= 1;
+    case 'less':
+      // `-o` / `-O` / `--log-file` はログをファイルへ書き、`+cmd` は起動時に less の
+      // コマンド(`!` ならシェル)を走らせる
+      return !shortOpt(args, 'oO', 'bhjkpPtTxyz#D')
+        && !args.some((a) => /^(--log-file|\+)/i.test(a));
+    case 'rg':
+      // `--pre` は検索の前に指定のコマンドを走らせる
+      return !args.some((a) => /^--pre(=|$)/.test(a));
+    case 'ss':
+      // `-K` / `--kill` はソケットを閉じる
+      return !shortOpt(args, 'K', 'fAFN') && !args.includes('--kill');
+    case 'file':
+      // `-C` / `--compile` は magic ファイルを書き出す
+      return !shortOpt(args, 'C', 'efFmP') && !args.some((a) => /^--compile/.test(a));
     case 'sort':
       // `-o file` はファイルへ書く
       return !args.some((a) => /^--output/.test(a) || /^-[A-Za-z]*o/.test(a));
@@ -1714,7 +1783,11 @@ function inspectSegment(words, depth) {
 // ssh: オプション(OPT_WITH_ARG。#45 の接続先の抽出と共有)を飛ばし、接続先より
 // 後ろの語を **相手側のコマンド** として判定し直す。
 // 偽にするもの: 後ろが空(対話ログイン)/ 踏み台越し(-J・ProxyJump・ProxyCommand・
-// -W、ssh の中の ssh)。2 段以上先のサーバーは、手元からは何をしているか言い切れない
+// -W、ssh の中の ssh)。2 段以上先のサーバーは、手元からは何をしているか言い切れない。
+// `-o` で **コマンドを走らせる設定**(LocalCommand・RemoteCommand など `…Command`)を
+// 渡しているものも偽
+const SSH_CMD_OPT_RE = /^(proxyjump|\w*command)/i;
+
 function inspectSsh(args, depth) {
   if (depth > 0) return false;
   let i = 0;
@@ -1722,8 +1795,9 @@ function inspectSsh(args, depth) {
     const a = args[i];
     if (!a.startsWith('-')) break;
     if (a === '-W' || /^-[A-Za-z]*J/.test(a)) return false;
-    if (/^-oproxy(jump|command)/i.test(a)) return false;
-    if (a === '-o' && /^proxy(jump|command)/i.test(args[i + 1] || '')) return false;
+    if (a.startsWith('-o') && SSH_CMD_OPT_RE.test(a === '-o' ? args[i + 1] || '' : a.slice(2))) {
+      return false;
+    }
     if (OPT_WITH_ARG.has(a)) i++;
   }
   const rest = args.slice(i + 1); // args[i] が接続先
@@ -1741,6 +1815,8 @@ const KUBECTL_READ = new Set([
 ]);
 
 function inspectKubectl(args) {
+  // `cluster-info dump --output-directory` と、ログをファイルへ書く `--log-file` / `--log-dir`
+  if (args.some((a) => /^--(output-directory|log-file|log-dir)/.test(a))) return false;
   const [sub, sub2] = positionals(args, KUBECTL_OPT_WITH_ARG);
   if (KUBECTL_READ.has(sub)) return true;
   if (sub === 'rollout') return sub2 === 'status' || sub2 === 'history';
@@ -1793,7 +1869,10 @@ function inspectDocker(args) {
 const GIT_OPT_WITH_ARG = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
 const GIT_READ = new Set(['log', 'status', 'diff', 'show', 'rev-parse', 'blame', 'ls-files']);
 
+// `-c core.pager=…` / `-c diff.external=…`・`--config-env`・`--exec-path=` は設定で別の
+// プログラムを走らせられるので偽。`--output=file`(log / diff / show)はファイルへ書くので偽
 function inspectGit(args) {
+  if (args.some((a) => a === '-c' || /^--(config-env|exec-path=|output)/.test(a))) return false;
   return GIT_READ.has(positionals(args, GIT_OPT_WITH_ARG)[0]);
 }
 
@@ -1829,6 +1908,8 @@ const CURL_LONG_WITH_ARG = new Set([
 ]);
 
 function inspectCurl(args) {
+  // `-w '%output{file}…'` は書式の途中からファイルへ書く
+  if (args.some((a) => a.includes('%output{'))) return false;
   const okMethod = (v) => /^(GET|HEAD)$/i.test(v || '');
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1858,12 +1939,131 @@ function inspectCurl(args) {
   return true;
 }
 
-// sed: `-i`(その場で書き換え)が無いこと。スクリプトの `w`(ファイルへ書く)と
-// `e`(コマンドを実行する)も書き込みになるので弾く
+// sed: `-i`(その場で書き換え)と `-f`(スクリプトがファイルにあり中身を見られない)が
+// 無く、スクリプトが **読めた命令だけ** でできているもの。ファイルへ書く `w` / `W` /
+// `s///w` と、コマンドを走らせる `e` / `s///e` は読めた上で偽にする。
+// 知らないオプション・知らない命令・読めない書き方も偽(作業側へ倒す)
+const SED_SHORT_FLAGS = 'nrEsuz';
+const SED_LONG_FLAGS = new Set([
+  '--quiet', '--silent', '--regexp-extended', '--separate', '--null-data', '--zero-terminated',
+  '--unbuffered', '--posix', '--debug', '--sandbox',
+]);
+
 function inspectSed(args) {
-  if (args.some((a) => /^--in-place/.test(a) || /^-[A-Za-z]*i/.test(a))) return false;
-  return !args.some((a) => !a.startsWith('-')
-    && /(^|[;{}\n]|\/[gpIiMm0-9]*)\s*[wWe](\s|$)/.test(a));
+  const scripts = [];
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') {
+      rest.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      if (name === '--expression') scripts.push(eq < 0 ? args[++i] : a.slice(eq + 1));
+      else if (name === '--line-length') { if (eq < 0) i++; }
+      else if (!SED_LONG_FLAGS.has(name)) return false; // --in-place / --file / 知らないもの
+      continue;
+    }
+    if (a.length < 2 || !a.startsWith('-')) {
+      rest.push(a);
+      continue;
+    }
+    // 短いオプションはまとめて書ける(`-ne 'p'`・`-e'p'`)。`-e` / `-l` の値は語の残りか次の語
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j];
+      if (c === 'e' || c === 'l') {
+        const v = j + 1 < a.length ? a.slice(j + 1) : args[++i];
+        if (c === 'e') scripts.push(v);
+        break;
+      }
+      if (!SED_SHORT_FLAGS.includes(c)) return false; // -i / -f / 知らないもの
+    }
+  }
+  // `-e` が無ければ最初の語がスクリプト
+  if (!scripts.length && rest.length) scripts.push(rest[0]);
+  return scripts.length > 0 && scripts.every((sc) => sc !== undefined && sedScriptReadOnly(sc));
+}
+
+// sed のスクリプトを命令ごとに読む。番地(`3` / `$` / `/re/` / `\%re%` / `first~step`、
+// `,` の後ろの `+N` / `~N`)と `!` を飛ばして、命令の文字で決める
+function sedScriptReadOnly(src) {
+  const s = String(src);
+  let i = 0;
+  // 区切り文字 d の次まで進む(`\` の次の文字は数えない)。閉じていなければ偽
+  const until = (d) => {
+    for (; i < s.length; i++) {
+      if (s[i] === '\\') i++;
+      else if (s[i] === d) {
+        i++;
+        return true;
+      }
+    }
+    return false;
+  };
+  const skipTo = (stops) => {
+    while (i < s.length && !stops.includes(s[i])) i++;
+  };
+  const address = () => {
+    if (s[i] === '$') i++;
+    else if (/[0-9]/.test(s[i] || '')) {
+      while (/[0-9~]/.test(s[i] || '')) i++;
+    } else if (s[i] === '/' || s[i] === '\\') {
+      const d = s[i] === '\\' ? s[++i] : '/';
+      i++;
+      if (!d || !until(d)) return false;
+      while (s[i] === 'I' || s[i] === 'M') i++;
+    }
+    return true;
+  };
+  while (i < s.length) {
+    if (/[\s;{}!]/.test(s[i])) {
+      i++;
+      continue;
+    }
+    if (s[i] === '#') {
+      skipTo('\n');
+      continue;
+    }
+    if (!address()) return false;
+    if (s[i] === ',') {
+      i++;
+      if (s[i] === '+' || s[i] === '~') i++;
+      if (!address()) return false;
+    }
+    while (/[ \t!]/.test(s[i] || '')) i++;
+    const c = s[i++];
+    if (c === undefined) return false;
+    if ('{}pPdDgGhHxnNzF='.includes(c)) continue;
+    if ('qQlL'.includes(c)) {
+      while (/[ \t0-9]/.test(s[i] || '')) i++; // 終了コード・折り返しの幅
+      continue;
+    }
+    // 行末までが文字列(a / i / c の挿入文・r / R の読むファイル)
+    if ('aicrR'.includes(c)) {
+      skipTo('\n');
+      continue;
+    }
+    if ('btT:'.includes(c)) { // ラベル
+      skipTo(';\n');
+      continue;
+    }
+    if (c === 's' || c === 'y') {
+      const d = s[i++];
+      if (!d || d === '\n' || d === '\\') return false;
+      if (!until(d) || !until(d)) return false;
+      // s の印は g / p / i / I / m / M / 数字だけ。w(ファイルへ書く)・e(実行)は偽
+      if (c === 's') {
+        for (; i < s.length && !/[\s;}#]/.test(s[i]); i++) {
+          if (!/[gpiImM0-9]/.test(s[i])) return false;
+        }
+      }
+      continue;
+    }
+    return false; // w / W / e / 知らない命令
+  }
+  return true;
 }
 
 // awk: プログラムに `system(`(コマンドの実行)・`>`(ファイルへ書く)・`|`(パイプで
@@ -1984,7 +2184,8 @@ function liveSubKeys() {
   return Object.keys(agents).filter((id) => !agents[id].isMain);
 }
 
-// メインへ報告しているサブの退室待ちタイマー(下の startReport)
+// メインへ報告しているサブの退室待ちタイマー(下の startReport)。
+// key → { timer, until: 報告を終えて退室する時刻 }
 const reportTimers = new Map();
 
 // ---- 手が動いているかの印(4.29「待機の場所」)------------------------------
@@ -2051,11 +2252,29 @@ function resetActivity(key, turn) {
 }
 
 // そのセッションで **まだ働いているサブ** の数。司令席へ報告に来ている体は
-// もう終わっているので数えない
-function workingSubCount(sessionId) {
+// もう終わっているので数えない。**OPEN_TOOL_MAX_MS(既定 10 分)以上なにも届いて
+// いないサブも数えない** —— `SubagentStop` が届かなかった・知らない `agent_id` で
+// 届いたサブは SessionEnd まで居残るので、数え続けるとボスがずっと「サブの報告待ち」
+// のまま待機に入れない。ツールの実行中を待つ上限(toolsOpen)と同じ長さにそろえる
+function workingSubCount(sessionId, now) {
   const sid = String(sessionId || '');
-  return liveSubKeys().filter((k) => String(agents[k].sessionId || '') === sid
-    && agents[k].action !== 'reporting').length;
+  return liveSubKeys().filter((k) => {
+    const a = agents[k];
+    return String(a.sessionId || '') === sid && a.action !== 'reporting'
+      && now - (a.updatedAt || 0) < OPEN_TOOL_MAX_MS;
+  }).length;
+}
+
+// そのセッションで報告中のサブのうち、いちばん遅く報告を終える体。無ければ null
+function reportingSubOf(sessionId) {
+  const sid = String(sessionId || '');
+  let found = null;
+  for (const [key, r] of reportTimers) {
+    const a = agents[key];
+    if (!a || String(a.sessionId || '') !== sid) continue;
+    if (!found || r.until > found.until) found = { sub: a, until: r.until };
+  }
+  return found;
 }
 
 // 手の空いたボスを充電ステーションで **起きたまま待機** させる(4.29)。
@@ -2063,13 +2282,19 @@ function workingSubCount(sessionId) {
 // 動かさないもの:
 //   ・充電ステーションに居るボス … 司令席へ戻すのは呼び戻し(recallMainForReport)の役目
 //   ・指示を受けてから応答完了までのあいだ / ツールを実行中 / 質問待ち / 報告を受けている最中
-//   ・そのセッションにまだ働いているサブが居る(司令席で「サブの報告待ち」)
+//   ・そのセッションにまだ働いているサブが居る(司令席で「サブの報告待ち」)。
+//     報告を受け終えたボスはここで「サブの報告待ち」に戻す。戻さないと、別のサブが
+//     まだ働いているあいだ「X の報告を受けています」が出たままになる
 function settleIdleMain(m, now) {
   if (!m || !m.isMain || m.room === 'lounge') return false;
   if (turnOpen(m.id) || toolsOpen(m.id, now)) return false;
   if (m.action === 'asking') return false;
   if (m.receivingUntil && now < m.receivingUntil) return false;
-  if (workingSubCount(m.sessionId) > 0) return false;
+  if (workingSubCount(m.sessionId, now) > 0) {
+    if (m.room !== 'desk' || m.action !== 'idle' || m.task === 'サブの報告待ち') return false;
+    m.task = 'サブの報告待ち';
+    return true;
+  }
   m.room = 'lounge';
   m.action = 'idle';
   clearConn(m);
@@ -2084,7 +2309,7 @@ function settleIdleMain(m, now) {
 function dropSub(key) {
   const t = reportTimers.get(key);
   if (t) {
-    clearTimeout(t);
+    clearTimeout(t.timer);
     reportTimers.delete(key);
   }
   delete agents[key];
@@ -2166,6 +2391,12 @@ function recallMainForReport(sub, now) {
   const free = (m.room === 'lounge' && (m.action === 'idle' || m.action === 'resting'))
     || (m.room === 'desk' && m.action === 'idle');
   if (!free) return;
+  receiveReport(m, sub, now, now + REPORT_MS);
+}
+
+// ボスを司令席に立たせて、until までサブの報告を受けさせる。呼び戻し(上)と、
+// 手が空かないまま報告が始まったあとの Stop(handleEvent)から呼ぶ
+function receiveReport(m, sub, now, until) {
   m.room = 'desk';
   m.action = 'idle';
   m.task = `${sub.name || 'サブエージェント'} の報告を受けています`;
@@ -2174,7 +2405,7 @@ function recallMainForReport(sub, now) {
   //   ・`receivingUntil` … 報告のあいだは必ず席に居させる。`--idle` を短くして
   //     いるときでも、報告の最中に充電へ戻ってしまわないようにするため
   m.updatedAt = now;
-  m.receivingUntil = now + REPORT_MS;
+  m.receivingUntil = Math.max(m.receivingUntil || 0, until);
 }
 
 function startReport(key, now) {
@@ -2209,7 +2440,7 @@ function startReport(key, now) {
     }
   }, REPORT_MS);
   if (timer.unref) timer.unref();
-  reportTimers.set(key, timer);
+  reportTimers.set(key, { timer, until: now + REPORT_MS });
   return entry;
 }
 
@@ -2814,23 +3045,27 @@ function handleEvent(ev) {
     }
     case 'Stop': {
       // 応答が完了した(4.29)。指示と開いたツールの印を落とし、行き先を 3 つに分ける:
-      //   ・サブの報告を受けている最中 … 動かさない(報告が終われば待機に入る)
+      //   ・そのセッションのサブが報告中 … **司令席で報告を受ける**(報告が終われば待機に入る)。
+      //     作業中に報告が始まって呼び戻せなかったときも、報告を受けている最中に別の
+      //     部屋へ移ったあとの Stop もここで席へ戻す。戻さないと、誰も居ない司令席で
+      //     サブが報告するか、ボスがツールの部屋にチップを出したまま残る
       //   ・そのセッションにまだ働いているサブが居る … 司令席で「サブの報告待ち」
       //   ・それ以外 … **すぐ充電ステーションへ移り、起きたまま待機**
       // 以前は司令席で idle になり、60 秒経ってから充電ステーションへ移っていた
       //(連続タスク中に往復しないため。この判断は 4.29 で意図して覆した)
       resetActivity(main.id, false);
       clearConn(main); // 通信管制室・索敵室から離れた(#45)
-      if (!(main.receivingUntil && now < main.receivingUntil)) {
-        if (workingSubCount(main.sessionId) > 0) {
-          main.room = 'desk';
-          main.action = 'idle';
-          main.task = 'サブの報告待ち';
-        } else {
-          main.room = 'lounge';
-          main.action = 'idle';
-          main.task = '応答完了';
-        }
+      const reporting = reportingSubOf(main.sessionId);
+      if (reporting) {
+        receiveReport(main, reporting.sub, now, reporting.until);
+      } else if (workingSubCount(main.sessionId, now) > 0) {
+        main.room = 'desk';
+        main.action = 'idle';
+        main.task = 'サブの報告待ち';
+      } else {
+        main.room = 'lounge';
+        main.action = 'idle';
+        main.task = '応答完了';
       }
       applyMeta(main, ev);
       main.updatedAt = now;
@@ -3395,7 +3630,7 @@ function sweepOnce(now) {
     if (toolsOpen(key, now)) continue;
     // サブがまだ働いているボスも同じ(司令席で「サブの報告待ち」のまま)。
     // サブはバックグラウンドで動くので、ボスのイベントが止まっても仕事は続いている
-    if (a.isMain && workingSubCount(a.sessionId) > 0) continue;
+    if (a.isMain && workingSubCount(a.sessionId, now) > 0) continue;
     // 質問待ち(#44)は「手が空いている」のではなく利用者の回答待ちなので、
     // 60 秒経っても動かさない。イベントが来ないのは待っている証拠で、ここで
     // 充電ステーションへ移す(= ASK を消す)と **席を外している間にこそ見たい合図** が

@@ -4425,6 +4425,12 @@ void main(void)\r
           c.bubble.visible = false;
           // 充電へ向かう途中で退室したとき、ハッチで目を閉じないように
           c.pendingAction = null;
+          // 射出・ダッシュの途中でもハッチへは歩く。退室の途中で戻ってきたときは
+          // 部屋を移るダッシュとして出直す(射出の残りの曲線で歩く速さのまま戻らない)
+          c.launching = false;
+          c.dashing = false;
+          c.dashTrail = false;
+          c.slotRoom = null;
         }
       }
       // **名札の更新は recomputeTargets の後**。接続先の札の段(connRow)がそこで
