@@ -109,7 +109,8 @@
         <button id="btn-edit">Edit</button>
         <button id="btn-bash">Bash</button>
         <button id="btn-git">Git</button>
-        <button id="btn-remote">リモート接続</button>
+        <button id="btn-inspect">サーバー調査</button>
+        <button id="btn-remote">サーバー作業</button>
         <button id="btn-web">Web検索</button>
         <button id="btn-e2e">E2E</button>
         <button id="btn-think">不明ツール</button>
@@ -2870,6 +2871,18 @@ void main(void)\r
     // ドア(右端 112)とデスクのラグ(左端 364)のあいだが唯一の空白で、
     // ここに 190×102 のラグが収まる(実測は下の zones のコメント)
     serverroom: { x: 255, y: 358, label: '通信管制室' },
+    // 索敵室(DESIGN.md 4.29)。リモート接続のうち **見るだけのもの**(ログを読む・状態を
+    // 確かめる)をサーバーがここへ送る。変更するもの・判断がつかないものは
+    // 通信管制室のまま(server.js の remoteRoomOf)。
+    // 置き場所は **床に残っていた最後の空き** —— 充電ステーションのラグ(右端 506)と
+    // オペルームのラグ(左端 709)のあいだ、司令席のラグ(下端 390)の下。
+    // **どの方向にも数 px しか余裕が無い**:
+    //   ・上 … 奥列(y −57.5 / −54.5)のチップ(x 650〜694 / 562〜606)が部屋名
+    //          (x 607〜649)の左右 1px まで来る。部屋名を 3 文字までにしてあるのはこのため
+    //   ・下 … 足元の接続先の札は 2 段まで(3 段目は画面の下端 600 を越える)
+    // y 464 は verify:full の実測で決めた(DESIGN.md 4.29)。ラグは敷かない
+    //(観測ブリッジ・カタパルトと同じく、家具と部屋名で範囲を示す)
+    monitor: { x: 628, y: 464, label: '索敵室' },
   };
   const DOOR_POS = { x: 72, y: 505 }; // 入退室時の出現・消滅位置
 
@@ -3684,6 +3697,29 @@ void main(void)\r
     racks.lineStyle(0);
     stage.addChild(racks);
 
+    // 索敵室(DESIGN.md 4.29): **索敵モニター 1 つだけ**。画面 2 枚を横桟で束ね、支柱 2 本で
+    // 床に立てる。実描画は x 584〜672 / y 395〜442 で、司令席のラグ(下端 390)の
+    // 5px 下から始まる。奥列のキャラ(y 406.5 / 409.5)はこの前に立つ。
+    // **色は既に使っているものだけ**(端末の 0x1f242e / 0x123044 と稼働ランプの 2 色、
+    // 金属の濃い色)。検証は色の完全一致で数えるので、新しい色を足すと数が狂いうる
+    const scope = new PIXI.Graphics();
+    scope.beginFill(BASE.metalD).drawRect(598, 425, 6, 17).endFill();  // 支柱
+    scope.beginFill(BASE.metalD).drawRect(652, 425, 6, 17).endFill();
+    scope.beginFill(BASE.metalD).drawRect(584, 424, 88, 5).endFill();  // 横桟
+    for (const sx of [584, 630]) {
+      scope.beginFill(0x1f242e).drawRect(sx, 395, 42, 30).endFill();   // 画面の枠
+      scope.beginFill(0x123044).drawRect(sx + 3, 398, 36, 24).endFill();
+    }
+    // 左の画面はレーダー(司令席の表示面と同じ意匠)、右の画面は波形
+    scope.lineStyle(1.2, BASE.glowG, 0.85).drawCircle(605, 410, 9).drawCircle(605, 410, 4.5);
+    scope.moveTo(605, 410).lineTo(612, 404);
+    scope.lineStyle(1.2, BASE.glowB, 0.9).moveTo(636, 414)
+      .lineTo(643, 414).lineTo(647, 404).lineTo(652, 418).lineTo(656, 409).lineTo(660, 414).lineTo(666, 414);
+    scope.lineStyle(0);
+    stage.addChild(scope);
+    // 部屋名は画面の上。ラグが無いので家具から決める(観測ブリッジ・カタパルトと同じ)
+    roomLabel(ROOMS.monitor.label, 628, 390);
+
     // 入口 = カタパルト。**ハッチ(ドア)だけ**で作る(#46 → #50)。
     //
     // #46 では床にラグと発進デッキの鉄板(x 60〜234 / y 518〜540。2 本のレールと
@@ -3776,7 +3812,7 @@ void main(void)\r
     lampSec: 0.9, // 警告灯が明滅している秒数
   };
 
-  // 部屋の間の高速ダッシュ(Issue #2)。
+  // 部屋の間の高速ダッシュ(DESIGN.md 4.12 / 4.29)。
   //
   // 歩き(170px/s)では部屋の間を移るのに 2〜4 秒かかり、ツールが 1〜3 秒おきに
   // 切り替わると **着く前に次の状態が来て、通路を歩いている時間のほうが長くなる**。
@@ -4033,7 +4069,7 @@ void main(void)\r
       c.dashing = true;
     }
 
-    // 頭上チップ(action)は **出発と同時に** 切り替える(Issue #2)。
+    // 頭上チップ(action)は **出発と同時に** 切り替える(DESIGN.md 4.5 / 4.29)。
     // 以前は着いてから切り替えていたので、部屋の間を歩いている 2〜4 秒のあいだ
     // 前の作業のチップが出たままだった。
     // **充電(resting)だけは着いてから**。歩きながら目を閉じて手足をしまうと、
@@ -4395,7 +4431,7 @@ void main(void)\r
       refreshModelBoard();
     }
 
-    // 残像(#46 の射出 / Issue #2 のダッシュで共用)。進行方向の後ろへ球体の輪郭を
+    // 残像(#46 の射出 / 4.29 のダッシュで共用)。進行方向の後ろへ球体の輪郭を
     // 3 枚重ねる。間隔を速度から出しているので、**速いほど長く尾を引く**
     //(間隔の上限は DASH.gapMax)。濃さ k は射出なら boost、ダッシュなら残りの距離。
     // 色は担当色ではなく **球体の地の色**(c.bodyColor)。残像は球体そのものの
@@ -5501,11 +5537,17 @@ void main(void)\r
     { label: 'E2E(実ブラウザ)', agents: agentsOf(main('window', 'e2e', 'Bash: npx playwright test')) },
     // Git の作業(利用者の指示)は **司令席**。同じ Bash でもコマンドの中身で分かれる
     { label: 'Git(コミット)', agents: agentsOf(main('desk', 'git', 'Bash: git commit -m "..."')) },
-    // リモート接続の Bash はサーバールームへ(#43)。滞在中は接続先と
-    // 作業ディレクトリを名札の下に出す(#45)
+    // リモート接続の Bash は **見るだけなら索敵室・変更するなら通信管制室**
+    //(#43 → DESIGN.md 4.29)。どちらの部屋でも、滞在中は接続先と作業ディレクトリを
+    // 名札の下に出す(#45)。チップも分かれる(調査 READ / 作業 BASH)
     {
-      label: 'Bash(リモート接続)',
-      agents: agentsOf(main('serverroom', 'terminal', 'Bash: ssh deploy@app-01 "cd /var/www && systemctl status api"',
+      label: 'Bash(サーバー調査)',
+      agents: agentsOf(main('monitor', 'reading', 'Bash: ssh deploy@app-01 "cd /var/log/api && tail -n 100 error.log"',
+        conn('deploy@app-01', '/var/log/api', '~/work/claude-virtual-agents'))),
+    },
+    {
+      label: 'Bash(サーバー作業)',
+      agents: agentsOf(main('serverroom', 'terminal', 'Bash: ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"',
         conn('deploy@app-01', '/var/www', '~/work/claude-virtual-agents'))),
     },
     {
@@ -5599,7 +5641,7 @@ void main(void)\r
         main('library', 'writing', 'Write: タスクの割り振りメモ'),
         // 他の部屋と一緒に並んだサーバールームも見えるようにしておく(#43)。
         // メインとは別のホストに繋いでいる例(#45。誰がどこに繋いでいるか分かる)
-        sub(3, 'serverroom', 'terminal', 'Bash: ssh web01 でデプロイ先を確認', 'リュウ',
+        sub(3, 'serverroom', 'terminal', 'Bash: ssh web01 でデプロイを実行', 'リュウ',
           conn('web01', '', '~/work/infra')),
         sub(4, 'library', 'writing', 'コーディング: テストコードを追加', 'アムロ'),
         sub(5, 'workshop', 'reading', 'レポート: 資料を収集', 'ミライ'),
@@ -5609,13 +5651,17 @@ void main(void)\r
     {
       // ブライトだけ **朝から動いている** 想定で startedAt を渡す(#68)。
       // 経過が 分:秒 の他の行と並ぶので、桁が増えても列が崩れないことを目で見られる
-      label: '5人で並行作業(1 人は長時間稼働)',
+      label: '6人で並行作業(1 人は長時間稼働)',
       agents: agentsOf(
         main('desk', 'thinking', '進捗を確認中…'),
         // リュウとアムロを同じオペルームに入れて、**ボスがいないときの縦 1 列**
         // (先頭がサブ)も出るようにしてある
         sub(3, 'workshop', 'terminal', 'インフラ: 負荷テストを実行', 'リュウ'),
         sub(4, 'workshop', 'reading', 'コーディング: 差分を読み直す', 'アムロ'),
+        // 他の部屋と一緒に並んだ索敵室(DESIGN.md 4.29)。サーバールームと同じく、
+        // メイン単独のコマとこのコマの 2 か所に出す
+        sub(2, 'monitor', 'reading', 'Bash: kubectl logs deploy/api で起動を確認', 'カイ',
+          Object.assign(conn('context:prod', '', '~/work/infra'), { assignment: '本番 API の起動を確認' })),
         sub(5, 'library', 'writing', 'レポート: 週次報告書を執筆', 'ミライ'),
         sub(6, 'window', 'browsing', 'Webサーチ: ベンチマーク情報を収集', 'セイラ'),
         // トークンも一緒に持たせる。リモートのタイルでは経過とトークンが
@@ -5976,10 +6022,14 @@ void main(void)\r
   bindMain('btn-read', 'Read', 'workshop', 'reading', 'Read: DESIGN.md');
   bindMain('btn-edit', 'Edit', 'library', 'writing', 'Edit: server.js');
   bindMain('btn-bash', 'Bash', 'workshop', 'terminal', 'Bash: npm start');
-  // リモート接続(#43 / #45)。サーバールームへ移り、名札の下に接続先と
-  // 作業ディレクトリが出る
-  bindMain('btn-remote', 'リモート接続', 'serverroom', 'terminal',
-    'Bash: ssh deploy@app-01 "cd /var/www && systemctl status api"',
+  // リモート接続(#43 / #45)は **見るだけなら索敵室(READ)・変更するなら
+  // 通信管制室(BASH)**(DESIGN.md 4.29)。どちらも名札の下に接続先と作業ディレクトリが出る。
+  // server.js の remoteRoomOf と同じ割り当てにすること
+  bindMain('btn-inspect', 'サーバー調査', 'monitor', 'reading',
+    'Bash: ssh deploy@app-01 "cd /var/log/api && tail -n 100 error.log"',
+    { conn: 'deploy@app-01', connPath: '/var/log/api', cwd: '~/work/claude-virtual-agents' });
+  bindMain('btn-remote', 'サーバー作業', 'serverroom', 'terminal',
+    'Bash: ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"',
     { conn: 'deploy@app-01', connPath: '/var/www', cwd: '~/work/claude-virtual-agents' });
   bindMain('btn-web', 'Web検索', 'window', 'browsing', 'WebSearch: PixiJS v7 API');
   // E2E(#67)。Web 検索と **同じ部屋・違うチップ** なので、2 つ並べて見比べられる

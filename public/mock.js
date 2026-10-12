@@ -101,11 +101,17 @@
     { label: 'E2E(実ブラウザ)', agents: agentsOf(main('window', 'e2e', 'Bash: npx playwright test')) },
     // Git の作業(利用者の指示)は **司令席**。同じ Bash でもコマンドの中身で分かれる
     { label: 'Git(コミット)', agents: agentsOf(main('desk', 'git', 'Bash: git commit -m "..."')) },
-    // リモート接続の Bash はサーバールームへ(#43)。滞在中は接続先と
-    // 作業ディレクトリを名札の下に出す(#45)
+    // リモート接続の Bash は **見るだけなら索敵室・変更するなら通信管制室**
+    //(#43 → DESIGN.md 4.29)。どちらの部屋でも、滞在中は接続先と作業ディレクトリを
+    // 名札の下に出す(#45)。チップも分かれる(調査 READ / 作業 BASH)
     {
-      label: 'Bash(リモート接続)',
-      agents: agentsOf(main('serverroom', 'terminal', 'Bash: ssh deploy@app-01 "cd /var/www && systemctl status api"',
+      label: 'Bash(サーバー調査)',
+      agents: agentsOf(main('monitor', 'reading', 'Bash: ssh deploy@app-01 "cd /var/log/api && tail -n 100 error.log"',
+        conn('deploy@app-01', '/var/log/api', '~/work/claude-virtual-agents'))),
+    },
+    {
+      label: 'Bash(サーバー作業)',
+      agents: agentsOf(main('serverroom', 'terminal', 'Bash: ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"',
         conn('deploy@app-01', '/var/www', '~/work/claude-virtual-agents'))),
     },
     {
@@ -199,7 +205,7 @@
         main('library', 'writing', 'Write: タスクの割り振りメモ'),
         // 他の部屋と一緒に並んだサーバールームも見えるようにしておく(#43)。
         // メインとは別のホストに繋いでいる例(#45。誰がどこに繋いでいるか分かる)
-        sub(3, 'serverroom', 'terminal', 'Bash: ssh web01 でデプロイ先を確認', 'リュウ',
+        sub(3, 'serverroom', 'terminal', 'Bash: ssh web01 でデプロイを実行', 'リュウ',
           conn('web01', '', '~/work/infra')),
         sub(4, 'library', 'writing', 'コーディング: テストコードを追加', 'アムロ'),
         sub(5, 'workshop', 'reading', 'レポート: 資料を収集', 'ミライ'),
@@ -209,13 +215,17 @@
     {
       // ブライトだけ **朝から動いている** 想定で startedAt を渡す(#68)。
       // 経過が 分:秒 の他の行と並ぶので、桁が増えても列が崩れないことを目で見られる
-      label: '5人で並行作業(1 人は長時間稼働)',
+      label: '6人で並行作業(1 人は長時間稼働)',
       agents: agentsOf(
         main('desk', 'thinking', '進捗を確認中…'),
         // リュウとアムロを同じオペルームに入れて、**ボスがいないときの縦 1 列**
         // (先頭がサブ)も出るようにしてある
         sub(3, 'workshop', 'terminal', 'インフラ: 負荷テストを実行', 'リュウ'),
         sub(4, 'workshop', 'reading', 'コーディング: 差分を読み直す', 'アムロ'),
+        // 他の部屋と一緒に並んだ索敵室(DESIGN.md 4.29)。サーバールームと同じく、
+        // メイン単独のコマとこのコマの 2 か所に出す
+        sub(2, 'monitor', 'reading', 'Bash: kubectl logs deploy/api で起動を確認', 'カイ',
+          Object.assign(conn('context:prod', '', '~/work/infra'), { assignment: '本番 API の起動を確認' })),
         sub(5, 'library', 'writing', 'レポート: 週次報告書を執筆', 'ミライ'),
         sub(6, 'window', 'browsing', 'Webサーチ: ベンチマーク情報を収集', 'セイラ'),
         // トークンも一緒に持たせる。リモートのタイルでは経過とトークンが

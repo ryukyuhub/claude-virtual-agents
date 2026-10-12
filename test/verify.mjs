@@ -590,7 +590,7 @@ if (FULL) {
     else pass('オペルームにボスが 2 体そろっても名札の所属が 1px も欠けない', d);
   }
 
-  // ---- 5 部屋 + 休憩スペース + サーバールームが枠内に収まるか ----
+  // ---- 8 部屋(5 部屋 + 休憩スペース + サーバールーム + 索敵室)が枠内に収まるか ----
   //
   // 測るのは **誰も居ないオフィスとの画素差分** = キャラ側(球体・頭上チップ・
   // 名札・小道具)の実描画だけ。画面全体の inkBounds を見ると、床の縞が全幅・
@@ -602,13 +602,13 @@ if (FULL) {
     const margins = [];
     await render('office', {}, {}, 300);
     await page.evaluate(() => { window.__emptyOffice = H.pixels(); });
-    // 既定の並び(SLOT_OFFSETS)を 7 部屋 × 5 人で。加えて **ボス 2 体の並び**
-    //(MULTI_BOSS_SLOTS)も 1 件測る(#73)—— 上の 7 件はボスが必ず 1 体なので
+    // 既定の並び(SLOT_OFFSETS)を 8 部屋 × 5 人で。加えて **ボス 2 体の並び**
+    //(MULTI_BOSS_SLOTS)も 1 件測る(#73)—— 上の 8 件はボスが必ず 1 体なので
     // **新しい表を一度も通らない**。この表は外側が |x| = 94 まで広がるので
     //(既定の最大は 76)、**枠に近い部屋ほど効く**。左端にいちばん近いカタパルト
     //(x 140)で、8 人 = 表を使い切る形にして測る
     const cases = [];
-    for (const room of ['library', 'window', 'desk', 'workshop', 'entrance', 'lounge', 'serverroom']) {
+    for (const room of ['library', 'window', 'desk', 'workshop', 'entrance', 'lounge', 'serverroom', 'monitor']) {
       const list = [main(room, 'writing', 'x')];
       for (let i = 1; i < 5; i++) list.push(sub(i, room, 'reading', 'y'));
       cases.push({ label: room, list });
@@ -647,7 +647,7 @@ if (FULL) {
     margins.sort((a, b) => a.m - b.m);
     if (bad.length) fail('部屋の枠内', bad.join(' / '));
     else {
-      pass('7 部屋 × 5 人 + ボス 2 体 8 人が枠内に収まる',
+      pass('8 部屋 × 5 人 + ボス 2 体 8 人が枠内に収まる',
         'はみ出し 0 / 枠までの余白が最小なのは '
         + margins.slice(0, 3).map((r) => `${r.room} ${r.m}px`).join(' · '));
     }
@@ -721,7 +721,7 @@ if (FULL) {
     else pass('作業を行き来しても古いチップが残らない', detail);
   }
 
-  // ---- 部屋の間の高速ダッシュ(Issue #2) ----
+  // ---- 部屋の間の高速ダッシュ(DESIGN.md 4.29) ----
   //
   // 見るのは 4 つ:
   //   1. 速さ … オペルームの先頭(858, 265)からデータバンク(170, 235)までの 689px を
@@ -838,7 +838,7 @@ if (FULL) {
         chip: H.countColor(e2eImg, 0x2aa0b5) };
       // 窓際 → デスクへ移動中のコマ(#52)。**歩き出したら正面に戻る**ことを見る。
       // 直前の shoot で窓際に着いているので、ここから部屋だけ変えて 12 コマ
-      //(0.2 秒)進める。デスクまでは約 310px で、ダッシュ(Issue #2。約 0.6 秒で
+      //(0.2 秒)進める。デスクまでは約 310px で、ダッシュ(DESIGN.md 4.29。約 0.6 秒で
       // 着く)でも 3 分の 1 ほどしか進んでいないのでまだ移動中
       H.apply({
         main: { id: 'main', room: 'desk', action: 'browsing', task: 'WebSearch: PixiJS' },
@@ -1008,6 +1008,121 @@ if (FULL) {
       + `(重なりが無ければ ${r.one * 3}px)`;
     if (bad.length) fail('接続先の表示', bad.join(' / ') + ` | ${detail}`);
     else pass('接続先と作業ディレクトリがキャラの足元に出る(同室でも重ならない)', detail);
+  }
+
+  // ---- 索敵室の収まり(DESIGN.md 4.29) ----
+  //
+  // 索敵室は床に残った最後の空きに置いたので、**どの方向にも数 px しか余裕が無い**
+  //(office.js の ROOMS.monitor)。見るのは 3 つ:
+  //   1. 隣の部屋と重ならない … 索敵室 5 人の実描画(誰も居ないオフィスとの差分)と、
+  //      司令席 5 人・充電ステーション 5 人・オペルーム 8 人(3 列目まで埋まる)の
+  //      実描画が 1px も重ならない。チップはいちばん広いもの(ボス BASH / サブ READ)
+  //   2. 部屋名が隠れない … 部屋名の文字の色(BASE.label)を部屋名のまわりだけ数え、
+  //      索敵室と司令席に 5 人ずつ置いても誰も居ないときと同じ画素数のまま
+  //   3. 接続先の札は 2 段まで … 2 人が繋いでいると札の地の面積がちょうど 2 倍
+  //      (2 段目が画面の下端 600 で切れていない)
+  // **割り切りは記録だけ**(失敗にしない。DESIGN.md 4.29): 名札が 2 行(ボスが
+  // 2 体以上 = 所属の行が出る)のとき、司令席 2 人 × 索敵室 3 人で重なる画素と、
+  // 2 段目の札が下端で切れる量
+  {
+    const r = await page.evaluate(() => {
+      const shoot = (state) => {
+        H.makeRenderer('office', {});
+        H.apply(state);
+        H.step(320, 16);
+        return H.pixels();
+      };
+      const empty = shoot({});
+      const mask = (img) => {
+        const a = empty.data, d = img.data;
+        const m = new Uint8Array(d.length / 4);
+        for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+          m[p] = a[i] !== d[i] || a[i + 1] !== d[i + 1] || a[i + 2] !== d[i + 2] ? 1 : 0;
+        }
+        return m;
+      };
+      const both = (m1, m2) => { let n = 0; for (let p = 0; p < m1.length; p++) n += m1[p] & m2[p]; return n; };
+      const room = (name, n, opts = {}) => {
+        const s = {};
+        for (let i = 0; i < n; i++) {
+          const boss = i === 0 && opts.boss;
+          const id = boss ? (opts.bossId || 'main') : `${name}-${i}`;
+          s[id] = Object.assign({ id, room: name, action: boss ? 'terminal' : 'reading', task: 'x' },
+            boss ? { isMain: true } : { name: 'サブ' + i },
+            opts.project ? { project: 'claude-virtual-agents' } : {},
+            opts.conn ? { conn: 'deploy@app-01', connPath: '/var/log', cwd: '~/work/claude-virtual-agents' } : {});
+        }
+        return s;
+      };
+      // 1. 隣の部屋との重なり
+      const mon = mask(shoot(room('monitor', 5, { boss: true })));
+      const near = {
+        desk: both(mon, mask(shoot(room('desk', 5)))),
+        lounge: both(mon, mask(shoot(room('lounge', 5)))),
+        workshop: both(mon, mask(shoot(room('workshop', 8)))),
+      };
+      // 2. 部屋名(x 607〜649 / y 375〜390 のまわり)の文字の色
+      const labelPx = (img) => {
+        const d = img.data, w = img.width, s = w / 960;
+        let n = 0;
+        for (let y = Math.round(370 * s); y < Math.round(394 * s); y++) {
+          for (let x = Math.round(596 * s); x < Math.round(660 * s); x++) {
+            const i = (y * w + x) * 4;
+            if (d[i] === 0xa2 && d[i + 1] === 0xb6 && d[i + 2] === 0xcf) n++;
+          }
+        }
+        return n;
+      };
+      const label = {
+        empty: labelPx(empty),
+        crowded: labelPx(shoot(Object.assign(room('monitor', 5, { boss: true }), room('desk', 5)))),
+      };
+      // 3. 札の地(0xfffdf7)を索敵室の足元だけ数える
+      const plate = (img) => {
+        const d = img.data, w = img.width, s = w / 960;
+        let n = 0;
+        for (let y = Math.round(480 * s); y < img.height; y++) {
+          for (let x = Math.round(540 * s); x < Math.round(790 * s); x++) {
+            const i = (y * w + x) * 4;
+            if (d[i] === 0xff && d[i + 1] === 0xfd && d[i + 2] === 0xf7) n++;
+          }
+        }
+        return n;
+      };
+      const conn = {
+        one: plate(shoot(room('monitor', 1, { boss: true, conn: true }))),
+        two: plate(shoot(room('monitor', 2, { boss: true, conn: true }))),
+        // 名札が 2 行のとき(記録のみ)
+        oneP: plate(shoot(room('monitor', 1, { boss: true, conn: true, project: true }))),
+        twoP: plate(shoot(room('monitor', 2, { boss: true, conn: true, project: true }))),
+      };
+      // 割り切り(記録のみ): 名札が 2 行のとき、司令席 2 人 × 索敵室 3 人
+      const twoLine = both(
+        mask(shoot(room('desk', 2, { boss: true, project: true }))),
+        mask(shoot(room('monitor', 3, { boss: true, bossId: 'main-2', project: true })))
+      );
+      return { near, label, conn, twoLine };
+    });
+
+    const bad = [];
+    for (const [k, v] of Object.entries(r.near)) {
+      if (v !== 0) bad.push(`索敵室と${k}の人物が ${v}px 重なっている`);
+    }
+    if (!(r.label.empty > 0)) bad.push('部屋名の文字が見つからない — 計測が成立していない');
+    else if (r.label.crowded !== r.label.empty) {
+      bad.push(`部屋名が隠れている(${r.label.empty}px → ${r.label.crowded}px)`);
+    }
+    if (!(r.conn.one > 0)) bad.push('繋いでいるのに札が出ていない — 計測が成立していない');
+    else if (r.conn.two < r.conn.one * 1.95) {
+      bad.push(`2 段目の札が欠けている(1 人 ${r.conn.one}px → 2 人 ${r.conn.two}px / 欠けが無ければ ${r.conn.one * 2}px)`);
+    }
+    const detail = `重なり 司令席 ${r.near.desk}px · 充電 ${r.near.lounge}px · オペルーム ${r.near.workshop}px`
+      + ` / 部屋名 ${r.label.empty}px → 混雑時 ${r.label.crowded}px`
+      + ` / 札 1 人 ${r.conn.one}px → 2 人 ${r.conn.two}px`
+      + ` | 割り切り(名札 2 行): 司令席 2 人 × 索敵室 3 人の重なり ${r.twoLine}px`
+      + ` · 札 1 人 ${r.conn.oneP}px → 2 人 ${r.conn.twoP}px(欠け ${r.conn.oneP * 2 - r.conn.twoP}px)`;
+    if (bad.length) fail('索敵室の収まり', bad.join(' / ') + ` | ${detail}`);
+    else pass('索敵室は隣の部屋と重ならず、部屋名も隠れず、接続先の札が 2 段まで収まる', detail);
   }
 
   // ---- remote 縦横 × 体数 ----

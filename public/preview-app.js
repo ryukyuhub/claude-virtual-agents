@@ -155,10 +155,14 @@
   bindMain('btn-read', 'Read', 'workshop', 'reading', 'Read: DESIGN.md');
   bindMain('btn-edit', 'Edit', 'library', 'writing', 'Edit: server.js');
   bindMain('btn-bash', 'Bash', 'workshop', 'terminal', 'Bash: npm start');
-  // リモート接続(#43 / #45)。サーバールームへ移り、名札の下に接続先と
-  // 作業ディレクトリが出る
-  bindMain('btn-remote', 'リモート接続', 'serverroom', 'terminal',
-    'Bash: ssh deploy@app-01 "cd /var/www && systemctl status api"',
+  // リモート接続(#43 / #45)は **見るだけなら索敵室(READ)・変更するなら
+  // 通信管制室(BASH)**(DESIGN.md 4.29)。どちらも名札の下に接続先と作業ディレクトリが出る。
+  // server.js の remoteRoomOf と同じ割り当てにすること
+  bindMain('btn-inspect', 'サーバー調査', 'monitor', 'reading',
+    'Bash: ssh deploy@app-01 "cd /var/log/api && tail -n 100 error.log"',
+    { conn: 'deploy@app-01', connPath: '/var/log/api', cwd: '~/work/claude-virtual-agents' });
+  bindMain('btn-remote', 'サーバー作業', 'serverroom', 'terminal',
+    'Bash: ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"',
     { conn: 'deploy@app-01', connPath: '/var/www', cwd: '~/work/claude-virtual-agents' });
   bindMain('btn-web', 'Web検索', 'window', 'browsing', 'WebSearch: PixiJS v7 API');
   // E2E(#67)。Web 検索と **同じ部屋・違うチップ** なので、2 つ並べて見比べられる
