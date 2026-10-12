@@ -721,6 +721,93 @@ if (FULL) {
     else pass('作業を行き来しても古いチップが残らない', detail);
   }
 
+  // ---- 部屋の間の高速ダッシュ(Issue #2) ----
+  //
+  // 見るのは 4 つ:
+  //   1. 速さ … オペルームの先頭(858, 265)からデータバンク(170, 235)までの 689px を
+  //      約 0.6 秒で渡る。0.29 秒で道半ば(x≈528)、0.64 秒で着いている(x 170)。
+  //      歩き(170px/s)なら同じ時刻で x≈809 / 749 なので取り違えようがない
+  //   2. 残像 … 道半ばのコマで、球体の帯(目の中心 ±14px の行)の **後ろ側(右)** に
+  //      誰も居ないオフィスとの差分がどこまで伸びているか。残像が無ければ球体の
+  //      半幅 22 前後で止まり、あれば 3 枚目(18 × 3 = 54px 後ろ)の縁 76px まで届く
+  //   3. チップは出発と同時 … 道半ばで EDIT が出ていて、READ は残っていない。
+  //      ボスを置かないのは上の「行き来」と同じ理由(EDIT の地 = ボスの機体色)
+  //   4. 充電は着いてから … 司令席から充電ステーションへ向かうボスは、途中では
+  //      目を開けたまま(充電を出発と同時に当てると、0.19 秒で目の画素が半分ほどに
+  //      減る)。着いたら閉じる
+  // dt は 16ms 固定(射出の検査と同じ)。まばたき(稼働中 1.9 秒・待機 3.4 秒ごと)に
+  // 当たらない時刻を選んである
+  {
+    const r = await page.evaluate(([haloEye, bossEye]) => {
+      H.makeRenderer('office', {});
+      H.apply({});
+      H.step(2, 16);
+      const empty = H.pixels();
+      const sub1 = (room, action) => ({
+        'sub-1': { id: 'sub-1', room, action, task: 'x', name: 'サブ1' },
+      });
+      H.makeRenderer('office', {});
+      H.apply(sub1('workshop', 'reading'));
+      H.step(320, 16); // 射出で着いて、入室時の吹き出しも消えている
+      H.apply(sub1('library', 'writing')); // task は同じ = 吹き出しは出ない
+      H.step(18, 16);
+      const mid = H.pixels();
+      const s = mid.width / 960;
+      const e = H.boundsOfColor(mid, haloEye);
+      let trail = -1;
+      if (e) {
+        const cx = (e.x0 + e.x1) / 2, cy = (e.y0 + e.y1) / 2;
+        const a = empty.data, d = mid.data, w = mid.width;
+        for (let y = Math.round(cy - 14 * s); y <= Math.round(cy + 14 * s); y++) {
+          for (let x = w - 1; x >= 0; x--) {
+            const i = (y * w + x) * 4;
+            if (a[i] !== d[i] || a[i + 1] !== d[i + 1] || a[i + 2] !== d[i + 2]) {
+              trail = Math.max(trail, (x - cx) / s);
+              break;
+            }
+          }
+        }
+      }
+      const midX = e ? (e.x0 + e.x1) / 2 / s : -1;
+      const chips = { read: H.countColor(mid, 0x2e9e63), edit: H.countColor(mid, 0x3b82c4) };
+      H.step(22, 16); // 出発から 0.64 秒
+      const e2 = H.boundsOfColor(H.pixels(), haloEye);
+      const endX = e2 ? (e2.x0 + e2.x1) / 2 / s : -1;
+
+      // 4. 充電は着いてから
+      H.makeRenderer('office', {});
+      H.apply({ main: { id: 'main', room: 'desk', action: 'idle', task: 'x' } });
+      H.step(250, 16); // 4.0 秒。待機のまばたき(3.4〜3.54 秒)は過ぎている
+      const open = H.countColor(H.pixels(), bossEye);
+      H.apply({ main: { id: 'main', room: 'lounge', action: 'resting', task: 'x' } });
+      H.step(12, 16); // 0.19 秒。司令席から 158px のうち 50px ほど進んだところ
+      const moving = H.countColor(H.pixels(), bossEye);
+      H.step(300, 16);
+      const rest = H.countColor(H.pixels(), bossEye);
+      return { midX, endX, trail, chips, open, moving, rest };
+    }, [COLORS.haloEye, COLORS.bossEye]);
+
+    const bad = [];
+    if (r.midX < 0 || r.endX < 0) bad.push('サブの目が見つからない — 描画が読めていない');
+    else {
+      if (!(r.midX > 440 && r.midX < 620)) bad.push(`0.29 秒の位置が x=${r.midX.toFixed(0)}(ダッシュなら 528 前後 / 歩きだと 809)`);
+      if (Math.abs(r.endX - 170) > 2) bad.push(`0.64 秒でまだ着いていない(x=${r.endX.toFixed(0)} / データバンクは 170)`);
+      if (!(r.trail > 45)) bad.push(`残像が出ていない(球体の帯の後ろ側が ${r.trail.toFixed(0)}px で止まる)`);
+    }
+    if (!(r.chips.edit > 0)) bad.push(`移動中に EDIT のチップが出ていない(${r.chips.edit}px)`);
+    if (r.chips.read !== 0) bad.push(`移動中に READ のチップが残っている(${r.chips.read}px)`);
+    if (!(r.open > 0)) bad.push('ボスの目が見つからない — 描画が読めていない');
+    else {
+      if (r.moving < r.open * 0.85) bad.push(`充電へ向かう途中で目を閉じている(${r.moving}px / 開いているとき ${r.open}px)`);
+      if (r.rest > r.open * 0.3) bad.push(`充電ステーションに着いても目を閉じていない(${r.rest}px)`);
+    }
+    const detail = `0.29 秒 x=${r.midX.toFixed(0)} → 0.64 秒 x=${r.endX.toFixed(0)}(歩きなら 809 → 749)`
+      + ` / 残像 後ろへ ${r.trail.toFixed(0)}px / 移動中のチップ EDIT ${r.chips.edit}px · READ ${r.chips.read}px`
+      + ` / ボスの目 待機 ${r.open}px → 充電へ移動中 ${r.moving}px → 着いて ${r.rest}px`;
+    if (bad.length) fail('高速ダッシュ', bad.join(' / ') + ` | ${detail}`);
+    else pass('部屋の間は約 0.6 秒のダッシュ(残像付き)で、チップは出発と同時・充電は着いてから', detail);
+  }
+
   // ---- 窓際で背中を向ける(#48) ----
   //
   // 窓際のカウンターに着いたキャラは顔を見せない。判定は **目の画素が 0 か** で、
@@ -751,7 +838,8 @@ if (FULL) {
         chip: H.countColor(e2eImg, 0x2aa0b5) };
       // 窓際 → デスクへ移動中のコマ(#52)。**歩き出したら正面に戻る**ことを見る。
       // 直前の shoot で窓際に着いているので、ここから部屋だけ変えて 12 コマ
-      //(0.2 秒 = 等速 170px/s で 34px)進める。デスクまで 323px あるのでまだ移動中
+      //(0.2 秒)進める。デスクまでは約 310px で、ダッシュ(Issue #2。約 0.6 秒で
+      // 着く)でも 3 分の 1 ほどしか進んでいないのでまだ移動中
       H.apply({
         main: { id: 'main', room: 'desk', action: 'browsing', task: 'WebSearch: PixiJS' },
         'sub-1': { id: 'sub-1', room: 'desk', action: 'reading', task: 'Read: docs', name: 'セイラ' },

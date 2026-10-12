@@ -2826,7 +2826,9 @@ void main(void)\r
 
   const W = 960;
   const H = 600;
-  const WALK_SPEED = 170; // px/sec
+  // 歩く速さ(px/sec)。部屋の間の移動は高速ダッシュ(DASH)になったので、
+  // これで動くのは **退室(ハッチへ歩く)と、ダッシュの下限** だけ
+  const WALK_SPEED = 170;
 
   // 部屋のアンカー座標(キャラクターの立ち位置)
   const ROOMS = {
@@ -3774,6 +3776,21 @@ void main(void)\r
     lampSec: 0.9, // 警告灯が明滅している秒数
   };
 
+  // 部屋の間の高速ダッシュ(Issue #2)。
+  //
+  // 歩き(170px/s)では部屋の間を移るのに 2〜4 秒かかり、ツールが 1〜3 秒おきに
+  // 切り替わると **着く前に次の状態が来て、通路を歩いている時間のほうが長くなる**。
+  // そこで **どこへでも約 sec 秒で着く** ようにする。速さは出発時に
+  // `max(WALK_SPEED, 距離 / sec)` で 1 回だけ決め、**等速で進む**。
+  // 射出のように指数で寄せる方式は採らない —— 1 フレーム目に大きく飛んで
+  // 瞬間移動に見え、検証で「何秒で着くか」も測りにくくなるため。
+  //   sec    … 部屋の間の移動にかける秒数
+  //   trail  … 残像の濃さ(射出の初速と同じ 1 を上限にした係数)
+  //   gapMax … 残像どうしの間隔の上限(px)。間隔は速さに比例させているので、
+  //            画面の端から端(1 秒あたり 1000px を超える)では 3 枚がばらばらに
+  //            離れて見える。射出の初速(765px/s → 16.8px)は上限に掛からない
+  const DASH = { sec: 0.6, trail: 0.9, gapMax: 18 };
+
   // ハッチの発進演出。age は最後の発進からの経過秒(まだ一度も発進していなければ
   // Infinity)。**床の誘導灯は #50 で廃止した** — 置いてあった発進デッキの鉄板ごと
   // 省いたためで、床に直接ランプだけを残すと足元の装飾が増えて読みづらくなる
@@ -3846,7 +3863,7 @@ void main(void)\r
     // 毎フレーム引き直す
     const office = drawOffice(app.stage);
 
-    // 射出の残像(#46)。**背景より前・キャラより奥**に置く。キャラの上に乗せると
+    // 射出(#46)とダッシュの残像。**背景より前・キャラより奥**に置く。キャラの上に乗せると
     // 本体がにじんで、どれが本物か分からなくなる
     const trailLayer = new PIXI.Graphics();
     app.stage.addChild(trailLayer);
@@ -3932,6 +3949,13 @@ void main(void)\r
       c.launching = true;
       c.launchAt = time;
       lastLaunchAt = time;
+      // 高速ダッシュ(DASH)の状態。placed は「最初の目標(= 射出の行き先)を
+      // もう受け取ったか」で、**2 回目以降の目標の変化だけ** をダッシュにする
+      c.placed = false;
+      c.dashing = false;
+      c.dashSpeed = 0;
+      c.dashTrail = false; // 部屋を移るときだけ残像を出す
+      c.slotRoom = null;   // いまの目標を決めた部屋
       c.cont.position.set(c.pos.x, c.pos.y);
       charLayer.addChild(c.cont);
       chars.set(id, c);
@@ -3972,11 +3996,56 @@ void main(void)\r
           || (multiBoss ? MULTI_BOSS_SLOTS : SLOT_OFFSETS);
         byRoom[room].forEach((c, i) => {
           const off = slots[i % slots.length];
-          c.target.x = Math.max(40, Math.min(W - 40, anchor.x + off[0]));
-          c.target.y = Math.max(130, Math.min(H - 50, anchor.y + off[1]));
+          const tx = Math.max(40, Math.min(W - 40, anchor.x + off[0]));
+          const ty = Math.max(130, Math.min(H - 50, anchor.y + off[1]));
+          const moved = tx !== c.target.x || ty !== c.target.y;
+          const roomChanged = c.slotRoom !== room;
+          c.target.x = tx;
+          c.target.y = ty;
+          c.slotRoom = room;
+          if (moved) depart(c, roomChanged);
           c.connRow = c.info && c.info.conn ? connRow++ : 0;
         });
       }
+    }
+
+    // 目標が変わった瞬間に 1 回だけ呼ぶ。速さはここで決めて、着くまで変えない(DASH)
+    function depart(c, roomChanged) {
+      // 入室直後の最初の目標は **カタパルトの射出のまま** 通す(#46)
+      if (!c.placed) {
+        c.placed = true;
+        return;
+      }
+      // 射出の途中で **行き先の部屋が変わったら** ダッシュに切り替える。
+      // 同じ部屋の中で立ち位置がずれただけ(誰かが入室して並び直した)なら、
+      // 射出の曲線のまま新しい立ち位置へ向かう
+      if (c.launching) {
+        if (!roomChanged) return;
+        c.launching = false;
+      }
+      const dist = Math.hypot(c.target.x - c.pos.x, c.target.y - c.pos.y);
+      // ダッシュの途中で目標が変わったら、**速い方を保つ**。並び直しで目標が
+      // 近くへずれるたびに遅くなると、行き先へ着く時刻が後ろへずれていく
+      c.dashSpeed = Math.max(WALK_SPEED, dist / DASH.sec, c.dashing ? c.dashSpeed : 0);
+      // 残像は **部屋を移るときだけ**。同じ部屋の中の並び直しには付けない。
+      // 部屋を移るダッシュの途中で並び直しが来ても、残像は着くまで消さない
+      c.dashTrail = roomChanged || (c.dashing && c.dashTrail);
+      c.dashing = true;
+    }
+
+    // 頭上チップ(action)は **出発と同時に** 切り替える(Issue #2)。
+    // 以前は着いてから切り替えていたので、部屋の間を歩いている 2〜4 秒のあいだ
+    // 前の作業のチップが出たままだった。
+    // **充電(resting)だけは着いてから**。歩きながら目を閉じて手足をしまうと、
+    // どこへ向かっているのか分からなくなる(移動中は idle で通す)。
+    // 保留(pendingAction)は毎回上書きするので、作業を行き来しても古い値は残らない
+    function syncAction(c) {
+      const want = (c.info && c.info.action) || 'idle';
+      const moving = Math.hypot(c.target.x - c.pos.x, c.target.y - c.pos.y) > 2;
+      const now = want === 'resting' && moving ? 'idle' : want;
+      c.pendingAction = now === want ? null : want;
+      // 変わったときだけ呼ぶ(applyAction はチップのポップを再生し直すため)
+      if (now !== c.action) K.applyAction(c, now);
     }
 
     // 退室したサブエージェントの実績を「作業報告」として数秒だけ出す(#11)
@@ -4298,11 +4367,6 @@ void main(void)\r
           c.leaving = false; // 退室中に復帰した場合
         }
         c.info = a;
-        const action = a.action || 'idle';
-        // **元の action に戻ったら保留も消す**。変わったときだけ書いていたので、
-        // reading → writing(移動中)→ reading と戻ると writing が残り、
-        // 着いた先で EDIT のチップに切り替わっていた
-        c.pendingAction = action !== c.action ? action : null;
         if (a.task && a.task !== c.lastTask) {
           c.lastTask = a.task;
           K.showBubble(c, a.task);
@@ -4314,14 +4378,43 @@ void main(void)\r
           c.target.x = DOOR_POS.x;
           c.target.y = DOOR_POS.y;
           c.bubble.visible = false;
+          // 充電へ向かう途中で退室したとき、ハッチで目を閉じないように
+          c.pendingAction = null;
         }
       }
       // **名札の更新は recomputeTargets の後**。接続先の札の段(connRow)がそこで
       // 決まるので、先に描くと 1 回ぶん古い段で描いてしまう。
-      // 掲示板はキャラの名札から名前を取るので、さらにその後
+      // 掲示板はキャラの名札から名前を取るので、さらにその後。
+      // チップ(syncAction)も後 —— 移動中かどうかは新しい目標で決まる。
+      // 退室中の体は最後のチップのままハッチへ歩く(info はもう届かない)
       recomputeTargets();
+      for (const c of chars.values()) {
+        if (!c.leaving) syncAction(c);
+      }
       for (const c of chars.values()) K.refreshTag(c, mainLabel);
       refreshModelBoard();
+    }
+
+    // 残像(#46 の射出 / Issue #2 のダッシュで共用)。進行方向の後ろへ球体の輪郭を
+    // 3 枚重ねる。間隔を速度から出しているので、**速いほど長く尾を引く**
+    //(間隔の上限は DASH.gapMax)。濃さ k は射出なら boost、ダッシュなら残りの距離。
+    // 色は担当色ではなく **球体の地の色**(c.bodyColor)。残像は球体そのものの
+    // 影なので、サブが親ボスの色になる(#74)と尾も一緒に変わる。
+    // 地の色を入れるのは charKit 側(buildCharacter / applySuitColor)で、
+    // **それを持たない kit と組み合わされることがある** ので担当色へ落とす ——
+    // verify の「ボスの回帰」は現在の office.js に HEAD の charKit を挿して撮る。
+    // 判定は undefined で行う(0x000000 も正しい色なので真偽で見ない)
+    function drawTrail(c, ux, uy, speed, k) {
+      const r = c.halo.dims.r * c.size;
+      const cy0 = c.halo.dims.cy * c.size;
+      const trail = c.bodyColor === undefined ? c.color : c.bodyColor;
+      const gap = Math.min(speed * 0.022, DASH.gapMax);
+      for (let i = 1; i <= 3; i++) {
+        const back = gap * i;
+        trailLayer.beginFill(trail, 0.2 * k * (1 - i / 4))
+          .drawCircle(c.pos.x - ux * back, c.pos.y + cy0 - uy * back, r)
+          .endFill();
+      }
     }
 
     function update() {
@@ -4329,7 +4422,7 @@ void main(void)\r
       time += dt;
       const dead = [];
       let charging = false;
-      trailLayer.clear(); // 射出の残像は毎フレーム引き直す(#46)
+      trailLayer.clear(); // 射出(#46)とダッシュの残像は毎フレーム引き直す
 
       for (const c of chars.values()) {
         // 充電ステーションの明滅は「誰かが実際に充電されているか」で切り替える。
@@ -4340,11 +4433,17 @@ void main(void)\r
         const dx = c.target.x - c.pos.x;
         const dy = c.target.y - c.pos.y;
         const dist = Math.hypot(dx, dy);
-        // カタパルトの射出中だけ速い(#46)。boost は 1 から 0 へ指数で落ちる係数で、
-        // 速度にも残像の濃さにも使う。**退室は従来どおり等速** — 発進は入場だけの
-        // 演出で、退室はドアへ歩いてフェードする(作業報告カードを読ませる間)
-        const boost = c.launching ? Math.exp(-(time - c.launchAt) / LAUNCH.tau) : 0;
-        const speed = WALK_SPEED * (1 + (LAUNCH.boost - 1) * boost);
+        // 速さは 3 通り:
+        //   ・退室 … 歩き(WALK_SPEED)。発進は入場だけの演出で、退室はドアへ歩いて
+        //     フェードする(作業報告カードを読ませる間)
+        //   ・入室 … カタパルトの射出(#46)。boost は 1 から 0 へ指数で落ちる係数で、
+        //     速度にも残像の濃さにも使う
+        //   ・それ以外 … 出発時に決めたダッシュの速さ(DASH。等速)
+        const boost = c.launching && !c.leaving ? Math.exp(-(time - c.launchAt) / LAUNCH.tau) : 0;
+        let speed;
+        if (c.leaving) speed = WALK_SPEED;
+        else if (c.launching) speed = WALK_SPEED * (1 + (LAUNCH.boost - 1) * boost);
+        else speed = c.dashing ? c.dashSpeed : WALK_SPEED;
         let bounce;
         if (dist > 2) {
           const step = Math.min(dist, speed * dt);
@@ -4369,24 +4468,10 @@ void main(void)\r
           // その部屋にいる間ずっと左のままになる(球体の光沢と thinking の耳の
           // 左右差、ボスの持ち手も裏返る)
           bounce = -Math.abs(Math.sin(c.walkPhase)) * 5;
-          // 射出の残像。進行方向の後ろへ球体の輪郭を 3 枚重ねる。間隔を速度から
-          // 出しているので、**速いほど長く尾を引き、減速に合わせて自然に消える**。
-          // 色は担当色ではなく **球体の地の色**(c.bodyColor)。残像は球体そのものの
-          // 影なので、サブが親ボスの色になる(#74)と尾も一緒に変わる。
-          // 地の色を入れるのは charKit 側(buildCharacter / applySuitColor)で、
-          // **それを持たない kit と組み合わされることがある** ので担当色へ落とす ——
-          // verify の「ボスの回帰」は現在の office.js に HEAD の charKit を挿して撮る。
-          // 判定は undefined で行う(0x000000 も正しい色なので真偽で見ない)
-          if (boost > 0.06) {
-            const r = c.halo.dims.r * c.size;
-            const cy0 = c.halo.dims.cy * c.size;
-            const trail = c.bodyColor === undefined ? c.color : c.bodyColor;
-            for (let i = 1; i <= 3; i++) {
-              const back = speed * 0.022 * i;
-              trailLayer.beginFill(trail, 0.2 * boost * (1 - i / 4))
-                .drawCircle(c.pos.x - ux * back, c.pos.y + cy0 - uy * back, r)
-                .endFill();
-            }
+          // 残像。射出は boost で、ダッシュは残りの距離で薄くする(着く直前に消える)
+          if (c.launching && boost > 0.06) drawTrail(c, ux, uy, speed, boost);
+          else if (c.dashing && c.dashTrail && !c.leaving) {
+            drawTrail(c, ux, uy, speed, DASH.trail * Math.min(1, dist / 48));
           }
         } else {
           if (c.walking) {
@@ -4394,6 +4479,8 @@ void main(void)\r
             c.walkPhase = 0;
           }
           c.launching = false; // 持ち場に着いたら射出おわり
+          c.dashing = false;   // ダッシュも同じ
+          c.dashTrail = false;
           // **目標へ吸着させる**。移動は「残り 2px 以下なら止まる」なので、止まった
           // 位置は最後の 1 歩の大きさ次第で最大 2px ずれる。SLOT_OFFSETS は
           // 「目が隠れない間隔」を 1px 単位で解いた値なので、ずれたままだと
@@ -4401,7 +4488,7 @@ void main(void)\r
           // 実測が体ごとに ±3px 動いた)。ここで確定させれば設計値と一致する
           c.pos.x = c.target.x;
           c.pos.y = c.target.y;
-          // ポーズ・持ち物は目的地に到着してから切り替える
+          // 着いてから切り替えるのは充電(resting)だけ。ほかは出発と同時(syncAction)
           if (c.pendingAction) {
             K.applyAction(c, c.pendingAction);
             c.pendingAction = null;
