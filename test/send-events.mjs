@@ -197,7 +197,9 @@ const SCENARIO = [
   // 引っかけにしてある。判定はコマンド本文(tool_command)だけを見るので、
   // ここでサーバールームへ行ってはいけない
   ev('PreToolUse', 'Bash', 'ssh の設定ファイルを見る', { tool_command: 'cat ~/.ssh/config' }),
-  // リモート接続の Bash(#43)。同じ Bash でもコマンドの中身でサーバールームへ分かれる。
+  // リモート接続の Bash(#43)。同じ Bash でもコマンドの中身で部屋が分かれる。
+  // これは見るだけ(systemctl status)なので **索敵室**(DESIGN.md 4.29)。変更する
+  // コマンドとの振り分けは、あとの checkRemoteKinds で表にして確かめる。
   //
   // **実運用と同じ形**にしてある: `tool_input` は report.js が要約したもので、Bash では
   // `description`(= 日本語の説明文)が優先されるため **コマンドが 1 文字も入らない**。
@@ -338,7 +340,8 @@ const DO_BEFORE = new Map([
 // サブの表とは別に覗く
 const MAIN_CHECK_AFTER = new Map([
   [5, '説明文に ssh があるローカルのコマンド(room: workshop / conn なし が期待値)'],
-  [6, 'リモート接続(room: serverroom / conn: deploy@app-01 / connPath: /var/www / cwd あり が期待値)'],
+  // systemctl status は見るだけなので索敵室(DESIGN.md 4.29)。接続先は通信管制室と同じく出る
+  [6, 'リモート接続・見るだけ(room: monitor / action: reading / conn: deploy@app-01 / connPath: /var/www / cwd あり が期待値)'],
   [7, 'Git の作業(room: desk / action: git / conn が消えているのが期待値)'],
   [9, 'ローカルへ戻る(Write なので room: library / conn と cwd が消えているのが期待値)'],
   [11, 'E2E の MCP(room: window / action: e2e が期待値。#67)'],
@@ -897,6 +900,119 @@ async function checkSummaryFork() {
   return lines;
 }
 
+// ---- リモート接続の調査と作業(DESIGN.md 4.29)--------------------------------
+//
+// リモート接続のうち **見るだけなら索敵室(monitor / reading)・変更するなら
+// 通信管制室(serverroom / terminal)** に分かれること。**判断がつかないものは作業側**
+// に倒れること。ssh の中の git がサーバー作業になり、手元の git は司令席のままなこと。
+// コマンドを 1 件ずつ送って /state のボスの部屋と動作を表にする。最後の行の NG が 0 件なら合格。
+// シナリオ本体を流す利用者のサーバーとは分けて、**使い捨てサーバー**で確かめる
+//(コマンドの数だけボスが部屋を渡り歩くので、見ている画面を荒らさないため)。
+// **ポートは 3892** —— 3893 は要約の分岐、3894 / 3895 は入れ替え、3896 は色、
+// 3897 は #70、3898 は #66、3899 は verify.mjs が使う
+const KINDS_PORT = 3892;
+const KINDS_BASE = `http://127.0.0.1:${KINDS_PORT}`;
+const INSPECT = 'monitor / reading';
+const WORK = 'serverroom / terminal';
+// report.js が tool_command を切る長さ(200)ちょうどのコマンド。中身は見るだけでも、
+// 後ろが切れているかもしれないので作業側
+const LONG_CMD = ('ssh web01 \'tail -n 100 /var/log/app.log' + ' | grep -v healthcheck'.repeat(12)).slice(0, 199) + "'";
+const KIND_CASES = [
+  // [コマンド, 期待値, 説明]
+  ['ssh deploy@app-01 "cd /var/www && systemctl status api"', INSPECT, 'ssh の中が systemctl status'],
+  ["ssh web01 'tail -n 100 /var/log/nginx/error.log | grep -i timeout'", INSPECT, 'パイプでつないだ参照'],
+  ['ssh -p 2222 -i ~/.ssh/id_ed25519 web01 "df -h && free -m"', INSPECT, '値を取るオプションを飛ばす'],
+  ['ssh web01 uptime 2>/dev/null', INSPECT, '/dev/null へ捨てるのは許す'],
+  ['ssh web01 "docker logs --tail 50 api 2>&1 | grep ERROR"', INSPECT, 'ssh の中の docker logs / 2>&1'],
+  ["ssh web01 'journalctl -u api -n 200 --no-pager'", INSPECT, 'journalctl'],
+  ['ssh web01 "curl -s http://localhost:8080/health"', INSPECT, 'curl の GET'],
+  ['ssh web01 \'find /var/log -name "*.gz" -mtime +7\'', INSPECT, 'find(-delete / -exec なし)'],
+  ['ssh web01 "git -C /srv/app log --oneline -5"', INSPECT, 'ssh の中の git log'],
+  ['kubectl --context prod -n api get pods -o wide', INSPECT, 'kubectl get'],
+  ['kubectl logs -f deploy/api --tail=100', INSPECT, 'kubectl logs'],
+  ['kubectl rollout status deploy/api', INSPECT, 'kubectl rollout status'],
+  ['gh pr view 12 --json title,state', INSPECT, 'gh pr view'],
+  ['gh run list --limit 5', INSPECT, 'gh run list'],
+  ['gh api repos/o/r/pulls', INSPECT, 'gh api(GET)'],
+  ['docker -H tcp://10.0.0.5:2375 ps -a', INSPECT, 'docker -H ps'],
+  ['ssh deploy@app-01 "cd /var/www && git pull && systemctl restart api"', WORK, 'ssh の中の git pull(司令席ではない)'],
+  ["ssh web01 'sudo systemctl restart nginx'", WORK, 'sudo は常に作業'],
+  ['ssh web01', WORK, '対話ログイン'],
+  ['scp ./dist.tar.gz web01:/tmp/', WORK, 'scp は常に作業'],
+  ['rsync -av ./dist/ web01:/srv/app/', WORK, 'rsync は常に作業'],
+  ['kubectl apply -f deploy.yaml', WORK, 'kubectl apply'],
+  ['kubectl exec -it api-0 -- sh', WORK, 'kubectl exec'],
+  ['gh pr create --fill', WORK, 'gh pr create'],
+  ['gh api repos/o/r/issues -f title=x', WORK, 'gh api にフィールド(= POST)'],
+  ['gh api -X DELETE repos/o/r/git/refs/heads/x', WORK, 'gh api -X DELETE'],
+  ['ssh web01 "echo ok > /tmp/flag"', WORK, 'ファイルへのリダイレクト'],
+  ["ssh web01 'sed -i s/a/b/ /etc/app.conf'", WORK, 'sed -i'],
+  ['ssh web01 "find /tmp -name \'*.log\' -delete"', WORK, 'find -delete'],
+  ["ssh web01 'tail app.log $(rm -rf /tmp/x)'", WORK, 'コマンド置換'],
+  ["ssh -J bastion web01 'uptime'", WORK, '踏み台越し(-J)'],
+  ["ssh bastion 'ssh web01 uptime'", WORK, 'ssh の中の ssh'],
+  ['ssh web01 "cat app.log" && rm -rf ./cache', WORK, '手元で rm'],
+  ["ssh web01 'curl -X POST http://localhost/reload'", WORK, 'curl -X POST'],
+  ['ssh web01 "awk \'{print > \\"out.txt\\"}\' app.log"', WORK, 'awk でファイルへ書く'],
+  ['docker -H tcp://10.0.0.5:2375 rm -f api', WORK, 'docker -H rm'],
+  ["ssh web01 'mytool --flag'", WORK, '表に無いコマンド'],
+  ["ssh web01 'cat app.log", WORK, '閉じていない引用符'],
+  [LONG_CMD, WORK, `${LONG_CMD.length} 文字(切れているかもしれない)`],
+  // ローカルのコマンドは今までどおり
+  ['git commit -m "fix: x"', 'desk / git', '手元の git commit'],
+  ['git log --oneline -5', 'desk / git', '手元の git log(見るだけでも司令席)'],
+  ['git push && gh pr create --fill', 'desk / git', 'git と gh を続けて打つ(司令席の Git)'],
+  ['npm test', 'workshop / terminal', 'ローカルの Bash'],
+  ['ssh-keygen -t ed25519', 'workshop / terminal', 'ssh-keygen はリモートではない'],
+];
+
+async function checkRemoteKinds() {
+  const srv = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+    env: Object.assign({}, process.env, { CVA_PORT: String(KINDS_PORT) }),
+    stdio: 'ignore',
+  });
+  const lines = [];
+  const mainOf = async () => (await (await fetch(`${KINDS_BASE}/state`)).json()).agents.main || {};
+  try {
+    for (let i = 0; i < 25; i++) {
+      try { await mainOf(); break; } catch (e) { await sleep(200); }
+    }
+    let ng = 0;
+    const send = async (event) => {
+      await postTo(KINDS_BASE, Object.assign({ session_id: 'e2e-kinds', hook_event_name: 'PreToolUse',
+        tool_name: 'Bash', tool_input: 'コマンドを実行する' }, event));
+      const m = await mainOf();
+      return `${m.room} / ${m.action}`;
+    };
+    for (const [cmd, want, note] of KIND_CASES) {
+      const got = await send({ tool_command: cmd });
+      if (got !== want) ng++;
+      lines.push(`${got === want ? 'OK' : 'NG'}  ${note}: ${got}(期待値 ${want})`);
+    }
+    // tool_command が無い古い report.js は 80 文字の要約を見るので、80 文字から作業側
+    const shortInput = await send({ tool_input: 'ssh web01 uptime' });
+    const longInput = await send({ tool_input: 'ssh web01 "tail -n 100 /var/log/app.log | grep -v healthcheck | grep -v metrics"' });
+    for (const [got, want, note] of [[shortInput, INSPECT, '要約だけ(80 文字未満)'], [longInput, WORK, '要約だけ(80 文字)']]) {
+      if (got !== want) ng++;
+      lines.push(`${got === want ? 'OK' : 'NG'}  ${note}: ${got}(期待値 ${want})`);
+    }
+    // 接続先の札は索敵室でも出る(通信管制室と同じ)
+    await send({ tool_command: 'ssh deploy@app-01 "cd /var/log/api && tail -n 100 error.log"', cwd: REPO });
+    const st = await (await fetch(`${KINDS_BASE}/state`)).json();
+    const m = st.agents.main || {};
+    const connOk = m.room === 'monitor' && m.conn === 'deploy@app-01' && m.connPath === '/var/log/api' && !!m.cwd;
+    if (!connOk) ng++;
+    lines.push(`${connOk ? 'OK' : 'NG'}  索敵室の接続先: ${JSON.stringify({ room: m.room, conn: m.conn, connPath: m.connPath, cwd: m.cwd })}`
+      + '(期待値 monitor / deploy@app-01 / /var/log/api / cwd あり)');
+    lines.push(`調査と作業の振り分け: ${KIND_CASES.length + 3} 件中 NG ${ng} 件(期待値 0 件)`);
+  } catch (e) {
+    lines.push(`確認できなかった: ${e.message} ← NG`);
+  } finally {
+    srv.kill();
+  }
+  return lines;
+}
+
 async function post(event) {
   const res = await fetch(`${BASE}/event`, {
     method: 'POST',
@@ -956,6 +1072,10 @@ async function main() {
     // #66 と同じく --idle=3 の使い捨てサーバーで確かめる
     console.log('--- 要約用の分岐を入室させない(agent_type が空 + サブ専用ファイル無し)---');
     for (const line of await checkSummaryFork()) console.log(`  ${line}`);
+    // リモート接続の調査と作業(DESIGN.md 4.29)。見るだけなら索敵室・変更するなら
+    // 通信管制室。判断がつかないものは作業側
+    console.log('--- リモート接続の調査と作業(見るだけ = 索敵室 / 変更 = 通信管制室)---');
+    for (const line of await checkRemoteKinds()) console.log(`  ${line}`);
     console.log(`完了。ブラウザ(${BASE})でキャラクターの動きを確認してください。`);
   } catch (e) {
     console.error('送信失敗: サーバーが起動していません。先に `npm start` を実行してください。');

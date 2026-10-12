@@ -1310,6 +1310,9 @@ function ensureMain(sessionId, now) {
 // 付いているときだけリモートとみなす
 const REMOTE_CMD_RE = /(?:^|[\s;&|(`])(?:sudo\s+)?(?:ssh|scp|sftp|rsync|kubectl|gh)(?:\.exe)?(?![\w.-])/i;
 const REMOTE_DOCKER_RE = /(?:^|[\s;&|(`])(?:sudo\s+)?docker(?:\.exe)?\s+(?:-H|--host)(?![\w-])/i;
+// 上から gh を除いたもの。**git より先に見る**(mapTool)ので分けてある ——
+// `ssh h 'cd /app && git pull'` はサーバーでの作業で、司令席の Git ではない
+const REMOTE_SHELL_RE = /(?:^|[\s;&|(`])(?:sudo\s+)?(?:ssh|scp|sftp|rsync|kubectl)(?:\.exe)?(?![\w.-])/i;
 
 // Git の作業(利用者の指示)。**司令席**へ送る。読み書きの部屋を入れ替えたときに
 // 司令席はツールの行き先ではなくなっていて(4.3)、コミットや push は
@@ -1366,6 +1369,11 @@ function commandText(toolInput, toolCommand) {
 function isRemoteCommand(text) {
   const s = String(text || '');
   return REMOTE_CMD_RE.test(s) || REMOTE_DOCKER_RE.test(s);
+}
+
+function isRemoteShell(text) {
+  const s = String(text || '');
+  return REMOTE_SHELL_RE.test(s) || REMOTE_DOCKER_RE.test(s);
 }
 
 // ---------------------------------------------------------- 接続先の抽出(#45)
@@ -1446,12 +1454,434 @@ function parseRemoteTarget(text) {
   return null;
 }
 
-// 接続先をエージェントへ反映する。サーバールーム以外では消す —
-// ssh は 1 コマンドごとに接続が切れるので「接続中」という状態が無く、
-// 別の部屋へ移った時点で古い接続先を出し続ける理由が無い
+// ---------------------------------------------------------- 調査と作業の振り分け(4.29)
+
+// リモート接続のうち **見るだけのもの(調査)を索敵室へ、それ以外(作業)を
+// 通信管制室へ** 送る(利用者の指示)。調査のチップは既存の READ(`reading`)を使う ——
+// ACTION_CHIP を増やさずに済むうえ、部屋の無いリモートモードでも READ / BASH で
+// 見分けられる。
+//
+// **判断がつかないものは作業側に倒す**。isRemoteInspect は「全部が参照系だと
+// 言い切れたときだけ真」で、表に無いコマンド・読めない書き方は全部偽になる。
+// 判定から漏れたコマンドは今までどおり通信管制室へ行くので、挙動の変化が最小で済む
+function remoteRoomOf(cmd, limit) {
+  return isRemoteInspect(cmd, limit)
+    ? { room: 'monitor', action: 'reading' }
+    : { room: 'serverroom', action: 'terminal' };
+}
+
+// report.js が切る長さ。これ以上の長さで届いたコマンドは **後ろが切れているかも
+// しれない**(`… && rm -rf x` が見えていないかもしれない)ので調査とは言い切れない。
+// tool_command が無いとき(古い report.js)は 80 文字の要約を見るので、そちらの長さ
+const REPORT_CMD_MAX = 200;
+const REPORT_INPUT_MAX = 80;
+
+function isRemoteInspect(cmd, limit) {
+  const s = String(cmd || '');
+  if (!s || s.length >= (limit || REPORT_CMD_MAX)) return false;
+  return inspectLine(s, 0);
+}
+
+// 1 行ぶんのシェルを判定する。depth は ssh の中へ潜った段数(踏み台越しを弾くため)。
+// **文字列の段階で弾く書き方**: `$(` とバッククォート(コマンド置換)、`<<`(ヒア
+// ドキュメント / ヒアストリング)、`<(` / `>(`(プロセス置換)。引用符の中でも弾く ——
+// ssh へ渡した文字列は **相手側のシェルがもう一度解釈する** ので、手元で引用されて
+// いても向こうでは置換として動く
+function inspectLine(text, depth) {
+  const s = String(text);
+  if (/\$\(|`|<<|<\(|>\(/.test(s)) return false;
+  const segs = shellSegments(s);
+  if (!segs || !segs.length) return false;
+  return segs.every((words) => inspectSegment(words, depth));
+}
+
+// シェルの 1 行を、引用符を考慮しながら **部分コマンド(語の配列)の列** に分ける。
+// 区切りは `|` / `||` / `|&` / `&&` / `;` / `&` / 改行 / `(` / `)`。語は引用符と
+// バックスラッシュを外した形で返す(ssh はこの語を空白でつないで相手へ渡す)。
+// 言い切れない書き方を見つけたら null:
+//   ・閉じていない引用符
+//   ・書き込みのリダイレクト(`>` / `>>` / `&>` / `>|`)。**/dev/null へ捨てるものと
+//     `N>&M`(複製)だけは許す** —— `2>&1` や `> /dev/null` は調査でもよく付く
+//   ・`<>`(読み書きで開く)
+// 読み込みのリダイレクト(`< file`)は読むだけなので語から外して先へ進む
+function shellSegments(text) {
+  const s = String(text);
+  const segs = [];
+  let words = [];
+  let word = '';
+  let inWord = false; // 空の引用符('')も 1 語として数えるため
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = '';
+    inWord = false;
+  };
+  const endSeg = () => {
+    endWord();
+    if (words.length) segs.push(words);
+    words = [];
+  };
+  // リダイレクトの行き先(1 語)を読む。返すのは { target, end }(end は最後の文字の位置)
+  const readTarget = (from) => {
+    let j = from;
+    while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
+    let t = '';
+    for (; j < s.length; j++) {
+      const c = s[j];
+      if (c === "'" || c === '"') {
+        const k = s.indexOf(c, j + 1);
+        if (k < 0) return null;
+        t += s.slice(j + 1, k);
+        j = k;
+        continue;
+      }
+      if (/\s/.test(c) || ';|&<>()'.includes(c)) break;
+      t += c;
+    }
+    return { target: t, end: j - 1 };
+  };
+  // リダイレクトの直前の数字(`2>` の 2)は語ではなく fd なので捨てる
+  const dropFd = () => {
+    if (/^\d+$/.test(word)) {
+      word = '';
+      inWord = false;
+    } else endWord();
+  };
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j < 0) return null;
+      word += s.slice(i + 1, j);
+      inWord = true;
+      i = j;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      for (; j < s.length && s[j] !== '"'; j++) {
+        if (s[j] === '\\' && j + 1 < s.length && '"\\$`'.includes(s[j + 1])) j++;
+        word += s[j];
+      }
+      if (j >= s.length) return null;
+      inWord = true;
+      i = j;
+      continue;
+    }
+    if (ch === '\\') {
+      if (i + 1 < s.length) {
+        word += s[++i];
+        inWord = true;
+      }
+      continue;
+    }
+    if (ch === '\n') { endSeg(); continue; }
+    if (/\s/.test(ch)) { endWord(); continue; }
+    if (ch === ';' || ch === '(' || ch === ')') { endSeg(); continue; }
+    if (ch === '|') {
+      endSeg();
+      if (s[i + 1] === '|' || s[i + 1] === '&') i++;
+      continue;
+    }
+    if (ch === '&') {
+      if (s[i + 1] === '&') { endSeg(); i++; continue; }
+      if (s[i + 1] !== '>') { endSeg(); continue; }
+      // `&>` / `&>>`(標準出力と標準エラーをまとめて)。行き先は /dev/null だけ許す
+      endWord();
+      let j = i + 2;
+      if (s[j] === '>') j++;
+      const t = readTarget(j);
+      if (!t || t.target !== '/dev/null') return null;
+      i = t.end;
+      continue;
+    }
+    if (ch === '>') {
+      dropFd();
+      let j = i + 1;
+      if (s[j] === '>' || s[j] === '|') j++;
+      if (s[j] === '&') {
+        // `>&2` / `>&-`(fd の複製・閉じる)は書き込みではない
+        let k = j + 1;
+        while (k < s.length && /\d/.test(s[k])) k++;
+        if (k > j + 1 || s[k] === '-') {
+          i = s[k] === '-' ? k : k - 1;
+          continue;
+        }
+        j++; // `>&file`(まとめて file へ)は下で行き先を見る
+      }
+      const t = readTarget(j);
+      if (!t || t.target !== '/dev/null') return null;
+      i = t.end;
+      continue;
+    }
+    if (ch === '<') {
+      if (s[i + 1] === '>') return null;
+      dropFd();
+      let j = i + 1;
+      if (s[j] === '&') {
+        let k = j + 1;
+        while (k < s.length && /[\d-]/.test(s[k])) k++;
+        i = k - 1;
+        continue;
+      }
+      const t = readTarget(j);
+      if (!t) return null;
+      i = t.end;
+      continue;
+    }
+    word += ch;
+    inWord = true;
+  }
+  endSeg();
+  return segs;
+}
+
+// 引数のうち **オプションでない語** を順に返す。withArg に挙げたオプションは
+// 直後の 1 語を値として読み飛ばす(`--opt=value` の形は 1 語なので飛ばさない)
+function positionals(args, withArg) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') {
+      out.push(...args.slice(i + 1));
+      break;
+    }
+    if (a.length > 1 && a.startsWith('-')) {
+      if (withArg && withArg.has(a)) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+// 引数を見ずに「見るだけ」と言い切れるコマンド。**ここに無いコマンドは偽**
+//(作業側へ倒す)。scp / sftp / rsync / sudo / doas / su / tee / xargs は
+// 書き込みや別コマンドの実行に使うので、わざと入れていない
+const INSPECT_ANY = new Set([
+  'cat', 'head', 'tail', 'less', 'more', 'grep', 'egrep', 'fgrep', 'zgrep', 'zcat', 'rg',
+  'ls', 'tree', 'wc', 'cut', 'jq', 'stat', 'du', 'df', 'free', 'uptime', 'ps', 'top', 'htop',
+  'w', 'who', 'whoami', 'id', 'uname', 'pwd', 'echo', 'printf', 'which', 'type', 'lsof',
+  'ss', 'netstat', 'dig', 'nslookup', 'host', 'ping', 'cd', 'sleep', 'true', 'false',
+  'test', '[', 'basename', 'dirname', 'realpath', 'readlink', 'file', 'md5sum', 'sha1sum',
+  'sha256sum', 'tac', 'nl', 'column', 'tr', 'diff', 'cmp', 'comm', 'printenv', 'nproc',
+  'lscpu', 'lsblk', 'vmstat', 'iostat', 'last', 'getent', 'groups', 'xxd', 'od',
+  'hexdump', 'strings',
+]);
+
+// 1 つの部分コマンド(語の配列)を判定する
+function inspectSegment(words, depth) {
+  let k = 0;
+  // 先頭の変数代入(`LANG=C grep …`)は読み飛ばす。代入だけの部分は何も書き換えない
+  while (k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k])) k++;
+  if (k >= words.length) return true;
+  // パス付き(/usr/bin/tail)や Windows の .exe も同じコマンドとして見る
+  const name = String(words[k]).split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
+  const args = words.slice(k + 1);
+  switch (name) {
+    case 'ssh': return inspectSsh(args, depth);
+    case 'kubectl': return inspectKubectl(args);
+    case 'gh': return inspectGh(args);
+    case 'docker': return inspectDocker(args);
+    case 'git': return inspectGit(args);
+    case 'curl': return inspectCurl(args);
+    case 'sed': return inspectSed(args);
+    case 'awk': case 'gawk': case 'mawk': return inspectAwk(args);
+    case 'systemctl': return inspectSystemctl(args);
+    case 'find':
+      return !args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(a));
+    case 'journalctl':
+      return !args.some((a) => /^--(vacuum|rotate|flush|sync|relinquish-var|smart-relinquish-var|setup-keys)/.test(a));
+    case 'service':
+      // `service api status` と `service --status-all` だけ
+      return args.includes('--status-all') || positionals(args)[1] === 'status';
+    case 'date':
+      return !args.some((a) => /^(-s|--set)/.test(a));
+    case 'sort':
+      // `-o file` はファイルへ書く
+      return !args.some((a) => /^--output/.test(a) || /^-[A-Za-z]*o/.test(a));
+    case 'uniq':
+      // 2 つ目の語は出力先のファイル
+      return positionals(args, new Set(['-f', '-s', '-w'])).length <= 1;
+    case 'hostname':
+      // 語を付けるとホスト名を書き換える
+      return !args.some((a) => /^(-F|--file)/.test(a)) && positionals(args).length === 0;
+    default:
+      return INSPECT_ANY.has(name);
+  }
+}
+
+// ssh: オプション(OPT_WITH_ARG。#45 の接続先の抽出と共有)を飛ばし、接続先より
+// 後ろの語を **相手側のコマンド** として判定し直す。
+// 偽にするもの: 後ろが空(対話ログイン)/ 踏み台越し(-J・ProxyJump・ProxyCommand・
+// -W、ssh の中の ssh)。2 段以上先のサーバーは、手元からは何をしているか言い切れない
+function inspectSsh(args, depth) {
+  if (depth > 0) return false;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('-')) break;
+    if (a === '-W' || /^-[A-Za-z]*J/.test(a)) return false;
+    if (/^-oproxy(jump|command)/i.test(a)) return false;
+    if (a === '-o' && /^proxy(jump|command)/i.test(args[i + 1] || '')) return false;
+    if (OPT_WITH_ARG.has(a)) i++;
+  }
+  const rest = args.slice(i + 1); // args[i] が接続先
+  if (i >= args.length || !rest.length) return false;
+  return inspectLine(rest.join(' '), depth + 1);
+}
+
+const KUBECTL_OPT_WITH_ARG = new Set([
+  '-n', '--namespace', '--context', '--cluster', '--user', '--kubeconfig', '-s', '--server',
+  '--token', '--as', '--as-group', '--request-timeout',
+]);
+const KUBECTL_READ = new Set([
+  'get', 'describe', 'logs', 'top', 'explain', 'version', 'cluster-info', 'events',
+  'api-resources', 'api-versions',
+]);
+
+function inspectKubectl(args) {
+  const [sub, sub2] = positionals(args, KUBECTL_OPT_WITH_ARG);
+  if (KUBECTL_READ.has(sub)) return true;
+  if (sub === 'rollout') return sub2 === 'status' || sub2 === 'history';
+  if (sub === 'config') return sub2 === 'view' || sub2 === 'get-contexts' || sub2 === 'current-context';
+  if (sub === 'auth') return sub2 === 'can-i';
+  return false;
+}
+
+const GH_OPT_WITH_ARG = new Set(['-R', '--repo']);
+const GH_READ_NOUNS = new Set(['pr', 'issue', 'run', 'release', 'repo', 'workflow']);
+const GH_READ_VERBS = new Set(['view', 'list', 'status', 'diff', 'checks', 'watch']);
+
+function inspectGh(args) {
+  const [sub, verb] = positionals(args, GH_OPT_WITH_ARG);
+  if (sub === 'status' || sub === 'search') return true;
+  if (sub === 'auth') return verb === 'status';
+  if (GH_READ_NOUNS.has(sub)) return GH_READ_VERBS.has(verb);
+  if (sub === 'api') return inspectGhApi(args);
+  return false;
+}
+
+// gh api は既定が GET だが、**フィールド(-f / -F)を付けると POST になる**。
+// メソッドの指定が GET / HEAD 以外か、本文を送るものは偽
+function inspectGhApi(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (/^(-[fF]|--field|--raw-field|--input)/.test(a)) return false;
+    const m = /^(?:-X|--method)=?(.*)$/.exec(a);
+    if (m) {
+      const v = (m[1] || args[++i] || '').toUpperCase();
+      if (v !== 'GET' && v !== 'HEAD') return false;
+    }
+  }
+  return true;
+}
+
+const DOCKER_OPT_WITH_ARG = new Set([
+  '-H', '--host', '-c', '--context', '--config', '-l', '--log-level',
+  '--tlscacert', '--tlscert', '--tlskey',
+]);
+const DOCKER_READ = new Set([
+  'ps', 'logs', 'inspect', 'images', 'stats', 'top', 'info', 'version', 'events', 'port',
+  'diff', 'history',
+]);
+
+function inspectDocker(args) {
+  return DOCKER_READ.has(positionals(args, DOCKER_OPT_WITH_ARG)[0]);
+}
+
+const GIT_OPT_WITH_ARG = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
+const GIT_READ = new Set(['log', 'status', 'diff', 'show', 'rev-parse', 'blame', 'ls-files']);
+
+function inspectGit(args) {
+  return GIT_READ.has(positionals(args, GIT_OPT_WITH_ARG)[0]);
+}
+
+const SYSTEMCTL_OPT_WITH_ARG = new Set([
+  '-H', '--host', '-M', '--machine', '-t', '--type', '-p', '--property', '-n', '--lines',
+  '-o', '--output', '--state', '--root',
+]);
+const SYSTEMCTL_READ = new Set([
+  'status', 'is-active', 'is-enabled', 'is-failed', 'is-system-running', 'list-units',
+  'list-unit-files', 'list-timers', 'list-sockets', 'list-dependencies', 'list-jobs',
+  'show', 'cat', 'get-default', 'show-environment',
+]);
+
+function inspectSystemctl(args) {
+  const [sub] = positionals(args, SYSTEMCTL_OPT_WITH_ARG);
+  return sub === undefined || SYSTEMCTL_READ.has(sub); // サブコマンド無しは list-units
+}
+
+// curl: GET / HEAD で、本文を送らず、ファイルへ書かないものだけ。
+// 短いオプションはまとめて書ける(`-sSo out`)ので 1 文字ずつ見る
+const CURL_SHORT_WRITE = 'dFTOoKcDQ';  // 本文 / アップロード / ファイルへ書く / 設定ファイル / FTP のコマンド
+const CURL_SHORT_WITH_ARG = 'HuAebmwxrzECYytPU';
+const CURL_LONG_WRITE = new Set([
+  '--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii', '--json',
+  '--form', '--form-string', '--upload-file', '--output', '--remote-name', '--remote-name-all',
+  '--output-dir', '--config', '--cookie-jar', '--dump-header', '--quote', '--trace',
+  '--trace-ascii', '--stderr', '--libcurl', '--etag-save', '--hsts', '--alt-svc',
+]);
+const CURL_LONG_WITH_ARG = new Set([
+  '--header', '--user', '--user-agent', '--referer', '--cookie', '--max-time', '--write-out',
+  '--proxy', '--range', '--connect-timeout', '--retry', '--cert', '--cacert', '--key',
+  '--resolve', '--url',
+]);
+
+function inspectCurl(args) {
+  const okMethod = (v) => /^(GET|HEAD)$/i.test(v || '');
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      if (CURL_LONG_WRITE.has(name)) return false;
+      if (name === '--request') {
+        if (!okMethod(eq < 0 ? args[++i] : a.slice(eq + 1))) return false;
+      } else if (eq < 0 && CURL_LONG_WITH_ARG.has(name)) i++;
+      continue;
+    }
+    if (a.length < 2 || !a.startsWith('-')) continue;
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j];
+      if (CURL_SHORT_WRITE.includes(c)) return false;
+      if (c === 'X') {
+        if (!okMethod(j + 1 < a.length ? a.slice(j + 1) : args[++i])) return false;
+        break;
+      }
+      if (CURL_SHORT_WITH_ARG.includes(c)) {
+        if (j === a.length - 1) i++; // 値は次の語
+        break;                        // 値がこの語の残り
+      }
+    }
+  }
+  return true;
+}
+
+// sed: `-i`(その場で書き換え)が無いこと。スクリプトの `w`(ファイルへ書く)と
+// `e`(コマンドを実行する)も書き込みになるので弾く
+function inspectSed(args) {
+  if (args.some((a) => /^--in-place/.test(a) || /^-[A-Za-z]*i/.test(a))) return false;
+  return !args.some((a) => !a.startsWith('-')
+    && /(^|[;{}\n]|\/[gpIiMm0-9]*)\s*[wWe](\s|$)/.test(a));
+}
+
+// awk: プログラムに `system(`(コマンドの実行)・`>`(ファイルへ書く)・`|`(パイプで
+// コマンドへ渡す)が無いこと。比較の `$3 > 100` も弾いてしまうが、作業側へ倒すだけ。
+// プログラムがファイル(-f)にあると中身を見られないので偽。gawk の `-i inplace` も偽
+function inspectAwk(args) {
+  if (args.some((a) => /^(-f|--file|-i|--include)/.test(a))) return false;
+  const program = positionals(args, new Set(['-F', '-v', '--field-separator', '--assign']))[0];
+  return program !== undefined && !/system\s*\(|>|\|/.test(program);
+}
+
+// 接続先をエージェントへ反映する。**通信管制室と索敵室**(リモート接続の行き先。
+// 4.29)以外では消す — ssh は 1 コマンドごとに接続が切れるので「接続中」という
+// 状態が無く、別の部屋へ移った時点で古い接続先を出し続ける理由が無い
+const CONN_ROOMS = new Set(['serverroom', 'monitor']);
+
 function applyConn(target, room, toolInput, toolCommand) {
   if (!target) return;
-  const t = room === 'serverroom' ? parseRemoteTarget(commandText(toolInput, toolCommand)) : null;
+  const t = CONN_ROOMS.has(room) ? parseRemoteTarget(commandText(toolInput, toolCommand)) : null;
   const host = t ? sanitizeConn(t.host) : '';
   const rpath = t && t.path ? sanitizeConn(t.path) : '';
   if (host) target.conn = host; else delete target.conn;
@@ -1492,14 +1922,19 @@ function mapTool(toolName, toolInput, toolCommand) {
   if (/(read|grep|glob|ls\b|search)/.test(n)) return { room: 'workshop', action: 'reading' };
   if (/(bash|shell|powershell|cmd|terminal|script)/.test(n)) {
     const cmd = commandText(toolInput, toolCommand);
+    // 届いた文字列が切られていうる長さ(commandText が tool_command を見たか要約を見たか)
+    const limit = String(toolCommand || '') ? REPORT_CMD_MAX : REPORT_INPUT_MAX;
+    // リモート接続は **見るだけなら索敵室(READ)・変更するなら通信管制室(BASH)**
+    //(#43 → 4.29)。ssh 系は **git より先に見る** —— `ssh h 'cd /app && git pull'` は
+    // サーバーでの作業で、司令席の Git ではない
+    if (isRemoteShell(cmd)) return remoteRoomOf(cmd, limit);
     // Git は **部屋も action も分ける**(利用者の指示)。頭上チップが BASH のままだと
     // 司令席で何をしているのかが読めないため、GIT のチップを持たせる
     if (isGitCommand(cmd)) return { room: 'desk', action: 'git' };
-    // リモート接続は **action は terminal のまま** 部屋だけを分ける(#43)。
-    // 端末を操作しているのは同じで、どこへ繋いでいるかは足元の札が語るため
-    return isRemoteCommand(cmd)
-      ? { room: 'serverroom', action: 'terminal' }
-      : { room: 'workshop', action: 'terminal' };
+    // 残りのリモート接続(gh)。git と一緒に打った gh(`git push && gh pr create`)は
+    // 従来どおり司令席の Git に寄せる
+    if (isRemoteCommand(cmd)) return remoteRoomOf(cmd, limit);
+    return { room: 'workshop', action: 'terminal' };
   }
   return { room: 'desk', action: 'thinking' };
 }
