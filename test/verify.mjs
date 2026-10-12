@@ -692,6 +692,35 @@ if (FULL) {
     else pass('カタパルトから勢いよく射出されて持ち場に着く', detail);
   }
 
+  // ---- 作業を行き来しても古いチップが残らない ----
+  //
+  // reading → writing(移動中)→ reading と **元の作業に戻る**と、以前は writing が
+  // 保留のまま残り、オペルームに戻ったのに EDIT のチップが出ていた。
+  // 数えるのは READ / EDIT のチップの地の色。**ボスを置かない** —— EDIT の地
+  //(0x3b82c4)はボスの機体色(既定の青)と同じ値で、ボスが居ると数が混ざる
+  {
+    const r = await page.evaluate(() => {
+      const at = (room, action) => ({
+        'sub-1': { id: 'sub-1', room, action, task: action, name: 'サブ1' },
+      });
+      H.makeRenderer('office', {});
+      H.apply(at('workshop', 'reading'));
+      H.step(300);
+      H.apply(at('library', 'writing'));
+      H.step(5); // データバンクへ向かう途中
+      H.apply(at('workshop', 'reading'));
+      H.step(300);
+      const img = H.pixels();
+      return { read: H.countColor(img, 0x2e9e63), edit: H.countColor(img, 0x3b82c4) };
+    });
+    const bad = [];
+    if (!(r.read > 0)) bad.push(`戻った先で READ のチップが出ていない(${r.read}px)`);
+    if (r.edit !== 0) bad.push(`戻った先で EDIT のチップが残っている(${r.edit}px)`);
+    const detail = `READ ${r.read}px / EDIT ${r.edit}px`;
+    if (bad.length) fail('作業の行き来とチップ', bad.join(' / ') + ` | ${detail}`);
+    else pass('作業を行き来しても古いチップが残らない', detail);
+  }
+
   // ---- 窓際で背中を向ける(#48) ----
   //
   // 窓際のカウンターに着いたキャラは顔を見せない。判定は **目の画素が 0 か** で、

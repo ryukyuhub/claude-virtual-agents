@@ -1489,7 +1489,10 @@
         }
         c.info = a;
         const action = a.action || 'idle';
-        if (action !== c.action) c.pendingAction = action;
+        // **元の action に戻ったら保留も消す**。変わったときだけ書いていたので、
+        // reading → writing(移動中)→ reading と戻ると writing が残り、
+        // 着いた先で EDIT のチップに切り替わっていた
+        c.pendingAction = action !== c.action ? action : null;
         if (a.task && a.task !== c.lastTask) {
           c.lastTask = a.task;
           K.showBubble(c, a.task);
