@@ -323,7 +323,7 @@ const BOSS_CHECK_AFTER = new Map([
   [27, '1 つ目が終わった(ボス 1 体 = 2 つ目だけ。project は消えるのが期待値。サブの mainKey / bossColor も消える(#74。単一セッションは従来の担当色に戻る))'],
   [29, '2 つ目も終わった(**最後の 1 体は残す** ので ボス 1 体が期待値)'],
   // ここから #70
-  [30, '墓標のセッションから指示が届いた(ボス 1 体・endedAt が消えて turns が 1 になるのが期待値)'],
+  [30, '墓標のセッションから指示が届いた(ボス 1 体・endedAt が消えて turns が 1 になる / 指示を受けたので desk / thinking / 指示を検討中 が期待値。4.29)'],
   [31, 'もう一度終わった(ボス 1 体・endedAt が立つのが期待値。オフィスは空にしない)'],
   [32, '3 つ目のセッションが開始(**亡霊が消えて main 1 体だけ** / turns が 0 / project は付かない が期待値)'],
 ]);
@@ -349,6 +349,9 @@ const MAIN_CHECK_AFTER = new Map([
   [21, '質問待ち(room: desk / action: asking が期待値)'],
   [22, '回答後(action: thinking に戻っているのが期待値)'],
   [23, '2 つ目のボスが入室(1 つ目の main は asking のまま残っているのが期待値。#58)'],
+  // 待機の場所(DESIGN.md 4.29)。Stop の時点で同じセッションのサブが働いているかで分かれる
+  [26, 'Stop・サブが働いている(room: desk / action: idle / task: サブの報告待ち が期待値。4.29)'],
+  [34, 'Stop・サブが居ない(room: lounge / action: idle / task: 応答完了 = すぐ充電ステーションで待機 が期待値。4.29)'],
 ]);
 
 async function showMain(label) {
@@ -443,9 +446,15 @@ async function checkRecall() {
     for (let i = 0; i < 25; i++) {
       try { await recallState(); break; } catch (e) { await sleep(200); }
     }
+    // 応答完了まで送る(4.29)。ツールを開いたまま(Post なし)だと「実行中」、
+    // Stop が無いと「指示の途中」とみなして、充電へ入らない
     await postTo(RECALL_BASE, {
       session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: 'DESIGN.md',
     });
+    await postTo(RECALL_BASE, {
+      session_id: sid, hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: 'DESIGN.md',
+    });
+    await postTo(RECALL_BASE, { session_id: sid, hook_event_name: 'Stop' });
     // 充電に入るまで待つ(--idle=3 + 巡回 3 秒 → 最大 6 秒。余裕を見て 12 秒)
     let charging = null;
     for (let i = 0; i < 40; i++) {
@@ -474,8 +483,9 @@ async function checkRecall() {
     await sleep(4000);
     const a2 = await recallState();
     lines.push(`報告 4 秒後: ボス ${a2.main.room} / ${a2.main.action}(期待値 desk / idle)`);
-    // 報告が終われば通常どおり手待ちに戻る(--idle=3 なのですぐ充電へ)
-    await sleep(6000);
+    // 報告が終われば充電ステーションで待機に入り(4.29)、--idle=3 なので
+    // その 3 秒あとに充電へ(巡回の間隔 3 秒ぶんの端数を見て、報告の終わりから 7 秒待つ)
+    await sleep(9000);
     const a3 = await recallState();
     lines.push(`報告おわり: ボス ${a3.main.room} / ${a3.main.action}`
       + ` / 在室サブ ${Object.keys(a3).filter((k) => !a3[k].isMain).length} 体`
@@ -721,14 +731,16 @@ async function checkTakeover() {
 // 入室させると名札が sub-N のまま居残るので、サーバーは
 // 「agent_type が空 + サブ専用ファイルが無い」イベントでは体を作らない。見るのは:
 //   ・分岐の PreToolUse で在室サブが増えない / Task で入れた仮キャラを引き取らない
-//   ・分岐の SubagentStop で作業報告が出ず、充電中のボスも呼び戻されない
+//   ・分岐の SubagentStop で作業報告が出ず、ボスも呼び戻されない(サブの報告待ちのまま)
 //   ・比較: agent_type が空でもサブ専用ファイルがあれば従来どおり(仮キャラを引き取る)。
 //     transcript_path が無くて場所を決められないときも従来どおり入室する
 //   ・SubagentStart は判定の対象外: agent_type が空でサブ専用ファイルが無くても入室する
 //   ・見送った agent_id は覚えない: あとでサブ専用ファイルを作って同じ ID で送ると入室する
 // 手順ごとに agent_id を分けてある(前の手順の残りが、あとの手順の NG の原因にならないように)。
 // 在室サブの数やツール回数は、絶対値ではなく **直前の手順との差**で判定する
-// ボスの呼び戻し(#66)は充電中のときだけ起きるので、#66 と同じく **`--idle=3` の
+// ボスの呼び戻し(#66)は手が空いているときだけ起きる。4.29 からは、仮キャラ(働いている
+// サブ)が居るボスは充電へ入らず **司令席で「サブの報告待ち」** になるので、呼び戻しは
+// 吹き出し(task)が「〜の報告を受けています」に変わるかで見る。#66 と同じく **`--idle=3` の
 // 使い捨てサーバー**で確かめる。サブ専用ファイルの置き方は #23 の模擬トランスクリプトに
 // 合わせ、後片付けも同じ cleanupTranscripts(TMP_DIR ごと消す)に任せる。
 // **ポートは 3893** —— 3895 / 3894 は入れ替え、3896 は色、3897 は #70、3898 は #66、
@@ -799,21 +811,22 @@ async function checkSummaryFork() {
     let n = subsOf(st).length;
     lines.push(`分岐の PreToolUse(仮キャラなし): 在室サブ ${n} 体(期待値 0 体)${ng(n === 0)}`);
 
-    // 2) Task で仮キャラを入れてから、ボスが充電に入るまで待つ(#66 と同じ手順)
+    // 2) Task で仮キャラを入れて応答を終える(Post と Stop)。仮キャラは働いている
+    //    サブなので、ボスは司令席で「サブの報告待ち」になる(4.29)
     await postTo(FORK_BASE, {
       session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Task',
       tool_input: '調査を依頼', subagent_type: 'planner', transcript_path: tx,
     });
-    let charging = null;
-    for (let i = 0; i < 40; i++) {
-      await sleep(300);
-      const m = (await snap()).agents.main;
-      if (m && m.action === 'resting') { charging = m; break; }
-    }
-    lines.push(charging
-      ? `充電に入った: ${charging.room} / ${charging.action}`
-      : '充電に入らなかった — この先の確認は成立していない ← NG');
-    if (!charging) return lines;
+    await postTo(FORK_BASE, {
+      session_id: sid, hook_event_name: 'PostToolUse', tool_name: 'Task',
+      tool_input: '調査を依頼', transcript_path: tx,
+    });
+    st = await send({ session_id: sid, hook_event_name: 'Stop', transcript_path: tx });
+    const WAIT_TASK = 'サブの報告待ち';
+    const waiting = st.agents.main;
+    lines.push(`Stop 後のボス: ${waiting.room} / ${waiting.action} "${waiting.task}"`
+      + `(期待値 desk / idle "${WAIT_TASK}")${ng(waiting.room === 'desk' && waiting.action === 'idle' && waiting.task === WAIT_TASK)}`);
+    if (waiting.task !== WAIT_TASK) return lines;
 
     // 3) 仮キャラが居るときの分岐。引き取られると仮キャラのツール回数が 1 に増える。
     //    手順 1 の ID とは別の ID を使い、送る前の状態との差で見る
@@ -824,14 +837,15 @@ async function checkSummaryFork() {
     lines.push(`分岐の PreToolUse / PostToolUse(仮キャラあり): 在室サブ ${Object.keys(cur).length} 体 / ツール回数 ${show(cur)}`
       + `(期待値 ${Object.keys(prev).length} 体 / ${show(prev)} = 増えず、仮キャラも引き取らない)${ng(sameTools(prev, cur))}`);
 
-    // 4) 手順 3 の分岐の SubagentStop。作業報告も、充電中のボスの呼び戻しも起きない
+    // 4) 手順 3 の分岐の SubagentStop。作業報告も、ボスの呼び戻しも起きない
+    //    (呼び戻されると吹き出しが「〜の報告を受けています」に変わる)
     st = await send(fork('SubagentStop', FORK_TASK_ID));
     let m = st.agents.main;
     let r = reportsOf(st);
     let nowSubs = subsOf(st).length;
-    lines.push(`分岐の SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action} / 在室サブ ${nowSubs} 体`
-      + `(期待値 0 件 / lounge / resting / ${Object.keys(prev).length} 体)`
-      + ng(r === 0 && m.room === 'lounge' && m.action === 'resting' && nowSubs === Object.keys(prev).length));
+    lines.push(`分岐の SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action} "${m.task}" / 在室サブ ${nowSubs} 体`
+      + `(期待値 0 件 / desk / idle "${WAIT_TASK}" / ${Object.keys(prev).length} 体)`
+      + ng(r === 0 && m.task === WAIT_TASK && nowSubs === Object.keys(prev).length));
     cur = toolsOf(st); // 次の手順の比較元(手順 4 が崩れていても、その状態を起点にする)
 
     // 5) 比較: agent_type が空でもサブ専用ファイルがあれば従来どおり。仮キャラを引き取る
@@ -864,8 +878,9 @@ async function checkSummaryFork() {
     });
     m = st.agents.main;
     r = reportsOf(st);
-    lines.push(`サブ専用ファイルありの SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action}`
-      + `(期待値 1 件 / desk / idle)${ng(r === 1 && m.room === 'desk' && m.action === 'idle')}`);
+    const receiving = / の報告を受けています$/.test(m.task || '');
+    lines.push(`サブ専用ファイルありの SubagentStop: 日報 ${r} 件 / ボス ${m.room} / ${m.action} "${m.task}"`
+      + `(期待値 1 件 / desk / idle "〜 の報告を受けています")${ng(r === 1 && m.room === 'desk' && m.action === 'idle' && receiving)}`);
 
     // 8) 比較: SubagentStart は判定の対象外。agent_type が空でサブ専用ファイルが無くても、
     //    実在のサブの開始通知なので従来どおり入室する(この時点で未紐付けの仮キャラは居ない)。
@@ -1013,6 +1028,129 @@ async function checkRemoteKinds() {
   return lines;
 }
 
+// ---- 待機の場所(DESIGN.md 4.29)---------------------------------------------
+//
+// 「待機中」が作業の実態と合っていること:
+//   ・指示を受けたら司令席で考え中 / 応答完了の直後に充電ステーションで起きたまま待機 /
+//     待機が続いたら充電(--idle=1 なので 1 秒)
+//   ・長いツールの実行中・サブが働いているあいだは待機にしない(司令席で「サブの報告待ち」)
+//   ・最後のサブの報告が終わったら待機に入る
+//   ・開いたままのツールが解ける 3 つの経路: 拒否(Post が来ずに Stop)/ 失敗
+//     (PostToolUseFailure)/ ESC(何も来ない → 上限時間。--idle=1 なので 10 秒)
+//   ・別のセッションの Stop は、もう 1 体のボスの「実行中」を巻き込まない
+// 1 秒で充電に入る設定なので、利用者のサーバーではなく **使い捨てサーバー** で確かめる。
+// **ポートは 3891** —— 3892 は調査と作業、3893 は要約の分岐、3894 / 3895 は入れ替え、
+// 3896 は色、3897 は #70、3898 は #66、3899 は verify.mjs が使う
+const WAIT_PORT = 3891;
+const WAIT_BASE = `http://127.0.0.1:${WAIT_PORT}`;
+
+async function checkWaitFlow() {
+  const srv = spawn(process.execPath, [path.join(REPO, 'server.js'), '--idle=1'], {
+    env: Object.assign({}, process.env, { CVA_PORT: String(WAIT_PORT) }),
+    stdio: 'ignore',
+  });
+  const lines = [];
+  let ng = 0;
+  let n = 0;
+  const A = 'e2e-wait-a';
+  const B = 'e2e-wait-b';
+  const SUB = 'e2ewaitsub00000001';
+  const snap = async () => (await (await fetch(`${WAIT_BASE}/state`)).json()).agents;
+  const bossOf = (agents, sid) => Object.values(agents).find((a) => a.isMain && a.sessionId === sid) || {};
+  const send = async (event) => {
+    await postTo(WAIT_BASE, Object.assign({ session_id: A }, event));
+    await sleep(150);
+  };
+  const tool = (hook, extra) => send(Object.assign({ hook_event_name: hook, tool_name: 'Bash',
+    tool_input: 'ビルドする', tool_command: 'npm run build' }, extra));
+  // want は 'room / action' か 'room / action / task'
+  const expect = async (label, want, sid = A) => {
+    const b = bossOf(await snap(), sid);
+    const got = want.split(' / ').length > 2 ? `${b.room} / ${b.action} / ${b.task}` : `${b.room} / ${b.action}`;
+    n++;
+    if (got !== want) ng++;
+    lines.push(`${got === want ? 'OK' : 'NG'}  ${label}: ${got}(期待値 ${want})`);
+  };
+  try {
+    for (let i = 0; i < 25; i++) {
+      try { await snap(); break; } catch (e) { await sleep(200); }
+    }
+    // 1. 指示 → 考え中 → 長いツール → 応答完了 → 待機 → 充電
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await expect('指示を受けた', 'desk / thinking / 指示を検討中');
+    await tool('PreToolUse');
+    await sleep(3000);
+    await expect('長いツールの実行中(3 秒無音)', 'workshop / terminal');
+    await tool('PostToolUse');
+    await send({ hook_event_name: 'Stop' });
+    await expect('応答完了の直後', 'lounge / idle / 応答完了');
+    await sleep(3000);
+    await expect('待機が続いた', 'lounge / resting / 充電中');
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await expect('充電中に指示を受けた', 'desk / thinking / 指示を検討中');
+
+    // 2. サブが働いているあいだは司令席で「サブの報告待ち」。報告が終われば待機
+    await send({ hook_event_name: 'PreToolUse', tool_name: 'Task', tool_input: '調査を依頼', subagent_type: 'planner' });
+    await send({ hook_event_name: 'SubagentStart', tool_input: '調査を依頼', agent_id: SUB, agent_type: 'planner' });
+    await send({ hook_event_name: 'PostToolUse', tool_name: 'Task', tool_input: '調査を依頼' });
+    await send({ hook_event_name: 'Stop' });
+    await expect('サブが働いているときの Stop', 'desk / idle / サブの報告待ち');
+    await tool('PreToolUse', { agent_id: SUB, agent_type: 'planner' });
+    await sleep(3000);
+    await expect('サブの長いツールの実行中(3 秒無音)', 'desk / idle / サブの報告待ち');
+    const sub = Object.values(await snap()).find((a) => !a.isMain) || {};
+    n++;
+    if (`${sub.room} / ${sub.action}` !== 'workshop / terminal') ng++;
+    lines.push(`${`${sub.room} / ${sub.action}` === 'workshop / terminal' ? 'OK' : 'NG'}  `
+      + `そのサブ(実行中なので手待ちにしない): ${sub.room} / ${sub.action}(期待値 workshop / terminal)`);
+    await tool('PostToolUse', { agent_id: SUB, agent_type: 'planner' });
+    await send({ hook_event_name: 'SubagentStop', agent_id: SUB });
+    const b = bossOf(await snap(), A);
+    const recalled = b.room === 'desk' && b.action === 'idle' && / の報告を受けています$/.test(b.task || '');
+    n++;
+    if (!recalled) ng++;
+    lines.push(`${recalled ? 'OK' : 'NG'}  報告を受ける: ${b.room} / ${b.action} / ${b.task}`
+      + '(期待値 desk / idle / 〜 の報告を受けています)');
+    // 報告は 6 秒。終わった瞬間に待機へ入り、その 1 秒後(--idle=1)に充電へ移るので、
+    // そのあいだ(6.0〜7.0 秒)で覗く
+    await sleep(6300);
+    await expect('最後のサブの報告が終わった', 'lounge / idle / 待機中');
+
+    // 3. 開いたままのツールが解ける経路
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await tool('PreToolUse'); // 拒否された = Post が来ない
+    await send({ hook_event_name: 'Stop' });
+    await sleep(3000);
+    await expect('拒否(Post が来ずに Stop)', 'lounge / resting');
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await tool('PreToolUse');
+    await tool('PostToolUseFailure');
+    await sleep(3000);
+    await expect('失敗(PostToolUseFailure)のあと無音', 'lounge / resting');
+
+    // 4. 別のセッションの Stop はもう 1 体のボスを巻き込まない
+    await send({ session_id: B, hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await tool('PreToolUse', { session_id: B });
+    await send({ hook_event_name: 'UserPromptSubmit', tool_input: '' });
+    await send({ hook_event_name: 'Stop' });
+    await sleep(3000);
+    await expect('もう 1 体のボス(A の Stop のあと 3 秒無音)', 'workshop / terminal', B);
+
+    // 5. ESC(何も来ない)。開いたままのツールは上限(--idle=1 なので 10 秒)で解ける
+    await tool('PreToolUse');
+    await sleep(3000);
+    await expect('ESC で止めた直後(ツールが開いたまま)', 'workshop / terminal');
+    await sleep(10000);
+    await expect('ESC で止めて上限時間が過ぎた', 'lounge / resting');
+    lines.push(`待機の場所: ${n} 件中 NG ${ng} 件(期待値 0 件)`);
+  } catch (e) {
+    lines.push(`確認できなかった: ${e.message} ← NG`);
+  } finally {
+    srv.kill();
+  }
+  return lines;
+}
+
 async function post(event) {
   const res = await fetch(`${BASE}/event`, {
     method: 'POST',
@@ -1076,6 +1214,10 @@ async function main() {
     // 通信管制室。判断がつかないものは作業側
     console.log('--- リモート接続の調査と作業(見るだけ = 索敵室 / 変更 = 通信管制室)---');
     for (const line of await checkRemoteKinds()) console.log(`  ${line}`);
+    // 待機の場所(DESIGN.md 4.29)。応答完了ですぐ待機・実行中とサブ待ちは待機にしない、
+    // を --idle=1 の使い捨てサーバーで確かめる
+    console.log('--- 待機の場所(応答完了ですぐ待機 / 実行中とサブ待ちは待機にしない)---');
+    for (const line of await checkWaitFlow()) console.log(`  ${line}`);
     console.log(`完了。ブラウザ(${BASE})でキャラクターの動きを確認してください。`);
   } catch (e) {
     console.error('送信失敗: サーバーが起動していません。先に `npm start` を実行してください。');

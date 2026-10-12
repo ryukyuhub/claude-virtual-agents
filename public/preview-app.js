@@ -171,8 +171,40 @@
   bindMain('btn-git', 'Git', 'desk', 'git', 'Bash: git commit -m "..."');
   bindMain('btn-think', '不明ツール', 'desk', 'thinking', 'MysteryTool: 未知のツールはフォールバック');
   bindMain('btn-ask', '質問待ち', 'desk', 'asking', '質問: 実装方針はどちらにしますか?');
-  bindMain('btn-stop', 'Stop', 'desk', 'idle', '応答完了。お疲れさまでした!');
+  // 指示を受けたら司令席で考え中(DESIGN.md 4.29。サーバーの UserPromptSubmit と同じ)
+  bindMain('btn-prompt', '指示', 'desk', 'thinking', '指示を検討中');
   bindMain('btn-rest', '充電', 'lounge', 'resting', '充電中');
+
+  // まだ働いているサブ(司令席へ報告に来ている体は数えない)。server.js の
+  // workingSubCount と同じ数え方
+  function workingSubs(s) {
+    return Object.keys(s).filter(function (k) {
+      return !s[k].isMain && s[k].action !== 'reporting';
+    }).length;
+  }
+
+  // 手の空いたボスを充電ステーションで待機させる(server.js の settleIdleMain)。
+  // 司令席で報告を待っていて、働いているサブがもう居なければ移る
+  function settleBoss(s) {
+    var boss = s.main;
+    if (!boss || boss.room !== 'desk' || boss.action !== 'idle' || workingSubs(s) > 0) return;
+    boss.room = 'lounge';
+    boss.task = '待機中';
+  }
+
+  // 応答完了(DESIGN.md 4.29)。サブが働いていれば司令席で「サブの報告待ち」、
+  // 居なければ **すぐ充電ステーションで起きたまま待機**(server.js の Stop と同じ分け方)
+  document.getElementById('btn-stop').addEventListener('click', function () {
+    manual('Stop', function (s) {
+      var waiting = workingSubs(s) > 0;
+      s.main.room = waiting ? 'desk' : 'lounge';
+      s.main.action = 'idle';
+      s.main.task = waiting ? 'サブの報告待ち' : '応答完了。お疲れさまでした!';
+      delete s.main.conn;
+      delete s.main.connPath;
+      delete s.main.cwd;
+    });
+  });
 
   // チームメンバーのサンプル(担当に応じた部屋・動作)。「サブ追加」で順に入室する
   // assignment は委譲された指示(#59)。task(直近のツール)と別に持つ。
@@ -307,6 +339,8 @@
       if (!key) return;
       var gone = s[key];
       delete s[key];
+      // 最後のサブが居なくなったら、報告を待っていたボスは待機に入る
+      settleBoss(s);
       // 中断(#57)はその場で消えるので、ここで日報を流してカードを確認できるように
       // する。通常の退室は **その前の「サブ報告」でカードを出しているので出さない**
       if (interrupted) {
@@ -332,11 +366,14 @@
       delete a.conn;
       delete a.connPath;
       delete a.cwd;
-      // 充電中のボスは司令席へ呼び戻す(#66)。サーバーも startReport で同じことを
-      // する。**充電中(resting)のときだけ** —— 別の部屋で作業しているボスは
+      // 手の空いているボスは司令席で報告を受ける(#66)。サーバーも startReport で
+      // 同じことをする。**充電ステーションで待機中・充電中か、司令席でサブの報告を
+      // 待っているときだけ**(DESIGN.md 4.29)—— 別の部屋で作業しているボスは
       // 手が空いていないので引きはがさない
       var boss = s.main;
-      if (boss && boss.action === 'resting') {
+      var free = boss && ((boss.room === 'lounge' && (boss.action === 'idle' || boss.action === 'resting'))
+        || (boss.room === 'desk' && boss.action === 'idle'));
+      if (free) {
         boss.room = 'desk';
         boss.action = 'idle';
         boss.task = (a.name || 'サブエージェント') + ' の報告を受けています';

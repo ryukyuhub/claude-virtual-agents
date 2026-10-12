@@ -45,10 +45,11 @@ function argValue(name) {
 // 指定方法: `npm start -- --boss=社長` / 環境変数 CVA_BOSS_NAME / .env の CVA_BOSS_NAME
 const BOSS_NAME = (argValue('boss') || process.env.CVA_BOSS_NAME || '').trim();
 
-// 手が空いたと見なすまでの秒数(省略時は 60。#47)。これを過ぎるとメインは
-// 充電ステーションへ移り、サブは idle に落ちる。
+// 待機が続いて充電に入るまでの秒数(省略時は 60。#47 → 4.29)。メインは応答完了の
+// 時点で充電ステーションへ移って待機し、これを過ぎると resting になる。サブは idle に落ちる。
+// 実行中のツールを待つ上限(OPEN_TOOL_MAX_MS)もこの 10 倍で決まる。
 // 指定方法: `npm start -- --idle=5` / 環境変数 CVA_IDLE_SEC / .env の CVA_IDLE_SEC。
-// 短くすると「充電に入ってからサブが報告に来る」流れ(#66)をすぐ試せる
+// 短くすると「応答完了 → 待機 → 充電」の流れをすぐ試せる
 const IDLE_TIMEOUT_MS = (() => {
   const raw = Number(argValue('idle') || process.env.CVA_IDLE_SEC || 0);
   return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1000) : 60 * 1000;
@@ -1986,6 +1987,98 @@ function liveSubKeys() {
 // メインへ報告しているサブの退室待ちタイマー(下の startReport)
 const reportTimers = new Map();
 
+// ---- 手が動いているかの印(4.29「待機の場所」)------------------------------
+//
+// 「待機中」を正しく出すために、**いまツールを実行中か・指示を受けてから応答完了
+// までのあいだか** をエージェントごとに覚える。無音 60 秒だけで待機とみなしていた
+// 頃は、長いビルドやテストの実行中も充電ステーションへ移っていた。
+//
+// **`/state` には出さない内部の Map に持つ**(reportTimers と同じやり方)。画面に
+// 出す値ではなくサーバーが判断に使うだけの値なので、エージェント本体に持たせると
+// クライアントへ流れてしまう(4.2「これは誰の値か」)。
+//   key(画面上のキー)→ { tools: 開いているツールの数, toolAt: 最後の Pre の時刻,
+//                          turn: 指示を受けてから Stop までのあいだか(メインだけ)}
+// 捨てるのは dropSub / retireMain(退室)。
+//
+// **印が残っても解ける**ように作る。Pre に対応する Post が来ないことがあるため:
+//   ・拒否 … Post は来ないが、Stop が来る(4.3 の #44 の実測)→ Stop で 0 に戻す
+//   ・失敗 … PostToolUseFailure(受け口だけ用意してある)か、次の Pre・Stop・UserPromptSubmit
+//   ・ESC  … 何も来ないので、OPEN_TOOL_MAX_MS で開いていないことにする
+const activity = new Map();
+// 前回の Pre からこれ以上空いていたら、前のまとまりは Post が来なかったものとみなす。
+// 並列のツールは同じ瞬間に Pre が並ぶので、この間隔の中に収まる
+const OPEN_TOOL_GAP_MS = 1500;
+// 開いたままのツールを「実行中」とみなす上限(既定 10 分)。ESC で止めると何も
+// 届かないので、これが無いとそのボスは二度と待機に入らない
+const OPEN_TOOL_MAX_MS = IDLE_TIMEOUT_MS * 10;
+
+function activityOf(key) {
+  let a = activity.get(key);
+  if (!a) {
+    a = { tools: 0, toolAt: 0, turn: false };
+    activity.set(key, a);
+  }
+  return a;
+}
+
+function openTool(key, now) {
+  const a = activityOf(key);
+  if (now - a.toolAt >= OPEN_TOOL_GAP_MS) a.tools = 0;
+  a.tools++;
+  a.toolAt = now;
+}
+
+function closeTool(key) {
+  const a = activity.get(key);
+  if (a && a.tools > 0) a.tools--;
+}
+
+function toolsOpen(key, now) {
+  const a = activity.get(key);
+  return !!a && a.tools > 0 && now - a.toolAt < OPEN_TOOL_MAX_MS;
+}
+
+function turnOpen(key) {
+  const a = activity.get(key);
+  return !!a && a.turn;
+}
+
+// 指示の区切り(UserPromptSubmit / Stop / セッションの終わり)。開いたツールも 0 に戻す
+function resetActivity(key, turn) {
+  const a = activityOf(key);
+  a.tools = 0;
+  a.turn = turn;
+}
+
+// そのセッションで **まだ働いているサブ** の数。司令席へ報告に来ている体は
+// もう終わっているので数えない
+function workingSubCount(sessionId) {
+  const sid = String(sessionId || '');
+  return liveSubKeys().filter((k) => String(agents[k].sessionId || '') === sid
+    && agents[k].action !== 'reporting').length;
+}
+
+// 手の空いたボスを充電ステーションで **起きたまま待機** させる(4.29)。
+// サブの報告が終わったとき(startReport のタイマー)と巡回(sweepOnce)から呼ぶ。
+// 動かさないもの:
+//   ・充電ステーションに居るボス … 司令席へ戻すのは呼び戻し(recallMainForReport)の役目
+//   ・指示を受けてから応答完了までのあいだ / ツールを実行中 / 質問待ち / 報告を受けている最中
+//   ・そのセッションにまだ働いているサブが居る(司令席で「サブの報告待ち」)
+function settleIdleMain(m, now) {
+  if (!m || !m.isMain || m.room === 'lounge') return false;
+  if (turnOpen(m.id) || toolsOpen(m.id, now)) return false;
+  if (m.action === 'asking') return false;
+  if (m.receivingUntil && now < m.receivingUntil) return false;
+  if (workingSubCount(m.sessionId) > 0) return false;
+  m.room = 'lounge';
+  m.action = 'idle';
+  clearConn(m);
+  m.task = '待機中';
+  // 「待機が 60 秒続いたら充電」の起点はここ
+  m.updatedAt = now;
+  return true;
+}
+
 // サブを画面から消す。**退室の後始末はここ 1 か所にまとめる**
 //(退室・報告おわり・中断・セッション終了の掃除から呼ぶ)
 function dropSub(key) {
@@ -1996,6 +2089,7 @@ function dropSub(key) {
   }
   delete agents[key];
   dropAgentCtx(key); // 退室したぶんの cwd / transcript 控えも捨てる(#41 / #42)
+  activity.delete(key); // 手が動いているかの印(4.29)
   const i = unboundSubKeys.indexOf(key);
   if (i >= 0) unboundSubKeys.splice(i, 1);
   for (const [agentId, k] of subKeyByAgentId) {
@@ -2061,12 +2155,17 @@ const REPORT_MS = 6000;
 // そのままだと誰も居ない席に向かって報告している絵になる。
 //
 // 戻すのは **そのサブのセッションのボスだけ**(複数プロジェクトのとき、関係の無い
-// ボスまで動かさない)。**充電中(resting)のときだけ**動かす —— 別の部屋で
-// 作業しているボスは手が空いていないので、報告のために引きはがさない
+// ボスまで動かさない)。**手が空いているときだけ**動かす —— 充電ステーションで
+// 待機中・充電中(lounge の idle / resting)か、司令席でサブの報告を待っている
+//(desk の idle)とき。別の部屋で作業しているボスは手が空いていないので、
+// 報告のために引きはがさない(4.29 で「待機中」と「サブの報告待ち」を足したので広げた)
 function recallMainForReport(sub, now) {
   const key = mainKeyBySession.get(String(sub.sessionId || ''));
   const m = key && agents[key];
-  if (!m || m.action !== 'resting') return;
+  if (!m) return;
+  const free = (m.room === 'lounge' && (m.action === 'idle' || m.action === 'resting'))
+    || (m.room === 'desk' && m.action === 'idle');
+  if (!free) return;
   m.room = 'desk';
   m.action = 'idle';
   m.task = `${sub.name || 'サブエージェント'} の報告を受けています`;
@@ -2096,7 +2195,14 @@ function startReport(key, now) {
     // 消すところまでは投げようがないので、投げても「報告中」の体が居残ることはない
     try {
       if (!agents[key]) return;
+      const sid = String(agents[key].sessionId || '');
       dropSub(key);
+      // 最後のサブの報告が終わったら、ボスは充電ステーションで待機に入る(4.29)。
+      // まだ働いているサブが居れば司令席のまま
+      // 時刻は報告の終わりより前にしない(タイマーが 1ms 早く起きると、報告を受けている
+      // 最中と読まれて次の巡回まで待機に入らない)
+      const mk = mainKeyBySession.get(sid);
+      if (mk && agents[mk]) settleIdleMain(agents[mk], Math.max(Date.now(), now + REPORT_MS));
       broadcast();
     } catch (e) {
       console.error('報告を終えたサブの退室に失敗しました:', e);
@@ -2142,6 +2248,7 @@ function retireMain(key, sessionId) {
   if (!a || !a.isMain) return false;
   delete agents[key];
   dropAgentCtx(key);
+  activity.delete(key);
   mainTotals.delete(key);
   mainKeyBySession.delete(String(sessionId || a.sessionId || ''));
   return true;
@@ -2166,6 +2273,8 @@ function endSession(sessionId, now) {
       // 直前に回収するので、「このセッションはもう終わった」という事実が
       // サーバーの中に残り、二度と消せないボス(#70 の経路 1)にならない
       a.endedAt = now;
+      // 開いたままのツールと指示の印も落とす(4.29)。キーで引くので他のボスは巻き込まない
+      resetActivity(key, false);
       changed = true;
     }
   }
@@ -2567,6 +2676,7 @@ function handleEvent(ev) {
           target.toolCount = (target.toolCount || 0) + 1;
           applyMeta(target, ev);
           target.updatedAt = now;
+          openTool(target.id, now); // 長いツールの実行中は手待ちにしない(4.29)
         }
       } else if (isTaskTool(toolName)) {
         // メインがサブエージェントを起動した。SubagentStart が登録されていない
@@ -2587,15 +2697,25 @@ function handleEvent(ev) {
         main.task = taskText(toolName, ev.tool_input);
         main.toolCount = (main.toolCount || 0) + 1;
       }
-      if (!isSubEvent) applyMeta(main, ev); // サブのエフォートをメインに書かない
+      if (!isSubEvent) {
+        applyMeta(main, ev); // サブのエフォートをメインに書かない
+        // ツールを開き、**指示の途中**の印を立てる(4.29)。UserPromptSubmit を
+        // 取りこぼしても、最初のツールで「応答完了までは待機にしない」が効く
+        openTool(main.id, now);
+        activityOf(main.id).turn = true;
+      }
       main.updatedAt = now;
       break;
     }
+    // ツールが失敗したときは PostToolUse の代わりにこれが来る(Claude Code の版による)。
+    // setup-hooks.mjs には足していない **受け口だけ** で、届けば Post と同じに扱う(4.29)
+    case 'PostToolUseFailure':
     case 'PostToolUse': {
       // 質問待ち(#44)が解けるのはここ。イベントの宛先(サブなら本人)だけを戻す
       const target = isSubEvent ? subForAgentId(ev, now) : main;
       if (target) { // 在室の上限で入室させられなかったサブ・要約用の分岐は飛ばす
         clearAsking(target);
+        closeTool(target.id);
         target.updatedAt = now;
       }
       main.updatedAt = now;
@@ -2682,14 +2802,36 @@ function handleEvent(ev) {
     case 'UserPromptSubmit': {
       main.turns = (main.turns || 0) + 1;
       main.turnStartedAt = now;
+      // 指示を受けたら **司令席で考え中**(4.29)。以前はここで動かさなかったので、
+      // 指示を受けても最初のツールが動くまで充電中のままだった
+      resetActivity(main.id, true);
+      main.room = 'desk';
+      main.action = 'thinking';
+      clearConn(main);
+      main.task = '指示を検討中';
       main.updatedAt = now;
       break;
     }
     case 'Stop': {
-      main.room = 'desk';
-      main.action = 'idle';
-      clearConn(main); // サーバールームから離れた(#45)
-      main.task = '応答完了';
+      // 応答が完了した(4.29)。指示と開いたツールの印を落とし、行き先を 3 つに分ける:
+      //   ・サブの報告を受けている最中 … 動かさない(報告が終われば待機に入る)
+      //   ・そのセッションにまだ働いているサブが居る … 司令席で「サブの報告待ち」
+      //   ・それ以外 … **すぐ充電ステーションへ移り、起きたまま待機**
+      // 以前は司令席で idle になり、60 秒経ってから充電ステーションへ移っていた
+      //(連続タスク中に往復しないため。この判断は 4.29 で意図して覆した)
+      resetActivity(main.id, false);
+      clearConn(main); // 通信管制室・索敵室から離れた(#45)
+      if (!(main.receivingUntil && now < main.receivingUntil)) {
+        if (workingSubCount(main.sessionId) > 0) {
+          main.room = 'desk';
+          main.action = 'idle';
+          main.task = 'サブの報告待ち';
+        } else {
+          main.room = 'lounge';
+          main.action = 'idle';
+          main.task = '応答完了';
+        }
+      }
       applyMeta(main, ev);
       main.updatedAt = now;
       refreshTokens(main.id); // 区切りでトークンを集計し直す
@@ -3240,8 +3382,20 @@ function sweepOnce(now) {
     lastAliveScan = now;
     if (sweepDeadSessions(now)) changed = true;
   }
-  for (const a of Object.values(agents)) {
+  // 手の空いたボスを充電ステーションで待機させる(4.29)。報告のタイマー
+  //(startReport)で拾えなかったぶん(中断の検知・セッション終了でサブが居なくなった
+  // ときなど)の受け皿
+  for (const key of liveMainKeys()) {
+    if (settleIdleMain(agents[key], now)) changed = true;
+  }
+  for (const [key, a] of Object.entries(agents)) {
     if (now - a.updatedAt <= IDLE_TIMEOUT_MS) continue;
+    // ツールを実行中(長いビルドやテスト)は手が空いていない(4.29)。イベントが
+    // 来ないのは待っている証拠で、充電へ移すと「待機中」の意味がずれる
+    if (toolsOpen(key, now)) continue;
+    // サブがまだ働いているボスも同じ(司令席で「サブの報告待ち」のまま)。
+    // サブはバックグラウンドで動くので、ボスのイベントが止まっても仕事は続いている
+    if (a.isMain && workingSubCount(a.sessionId) > 0) continue;
     // 質問待ち(#44)は「手が空いている」のではなく利用者の回答待ちなので、
     // 60 秒経っても動かさない。イベントが来ないのは待っている証拠で、ここで
     // 充電ステーションへ移す(= ASK を消す)と **席を外している間にこそ見たい合図** が
@@ -3251,10 +3405,11 @@ function sweepOnce(now) {
     // ボスだけが司令席とステーションを往復して報告が宙に浮く
     if (a.receivingUntil && now < a.receivingUntil) continue;
     if (a.isMain) {
-      // メインは充電ステーション(lounge)へ移動して充電される(#47)。応答完了の
-      // 直後ではなく 60 秒手が空いてから動かすので、連続タスク中にデスクと
-      // ステーションを往復しない。
-      // 次のツールイベントが来れば通常どおり該当の部屋へ歩いて戻る
+      // メインは充電ステーション(lounge)で充電される(#47)。応答完了の時点で
+      // もう充電ステーションへ移って起きたまま待機しているので(4.29)、ここでは
+      // **待機が 60 秒続いたら目を閉じて充電に入る**。ESC で止めて放置したとき
+      //(Stop が来ない)の受け皿もこれ。
+      // 次のツールイベントが来れば通常どおり該当の部屋へダッシュで戻る
       if (a.room !== 'lounge' || a.action !== 'resting') {
         a.room = 'lounge';
         a.action = 'resting';

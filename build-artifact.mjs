@@ -158,6 +158,7 @@ const BODY = `
         <button id="btn-delsub">サブ退室</button>
         <button id="btn-cutsub">サブ中断</button>
         <button id="btn-addboss">セッション追加</button>
+        <button id="btn-prompt">指示</button>
         <button id="btn-stop">Stop</button>
         <button id="btn-rest">充電</button>
       </div>

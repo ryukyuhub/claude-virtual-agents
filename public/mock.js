@@ -89,7 +89,10 @@
   }
 
   const SCENARIO = [
-    { label: 'セッション開始', agents: agentsOf(main('desk', 'idle', 'おはようございます。今日のタスクを始めます')) },
+    // 待機の場所(DESIGN.md 4.29)。指示を待っているボスは **充電ステーションで起きたまま**
+    // 待機し、指示を受けると **司令席で考え中** になる
+    { label: 'セッション開始(充電ステーションで待機)', agents: agentsOf(main('lounge', 'idle', '待機中')) },
+    { label: '指示を受ける(司令席で考え中)', agents: agentsOf(main('desk', 'thinking', '指示を検討中')) },
     { label: 'Read', agents: agentsOf(main('workshop', 'reading', 'Read: DESIGN.md')) },
     { label: 'Grep', agents: agentsOf(main('workshop', 'reading', 'Grep: createOfficeRenderer')) },
     { label: 'Edit', agents: agentsOf(main('library', 'writing', 'Edit: server.js')) },
@@ -147,12 +150,12 @@
       ),
     },
     {
-      // サブが働いているあいだ、メインは手が空いて **充電に入っている**(#66)。
-      // サブはバックグラウンドで動くのでメインのターンは先に終わる —— つまり
-      // 「サブが報告に来るときボスは充電中」はよくある状況
-      label: 'サブが作業中、メインは充電へ',
+      // サブはバックグラウンドで動くのでメインの応答は先に終わる(#66)。そのとき
+      // サブがまだ働いていれば、ボスは **司令席で「サブの報告待ち」**(DESIGN.md 4.29)。
+      // 充電ステーションへは移らない —— 手が空いているのではなく報告を待っている
+      label: 'サブが作業中、メインはサブの報告待ち',
       agents: agentsOf(
-        main('lounge', 'resting', '充電中'),
+        main('desk', 'idle', 'サブの報告待ち'),
         sub(1, 'library', 'writing', 'Write: レポート作成', 'シャア'),
         sub(2, 'workshop', 'reading', '調査: 未使用コードの洗い出し', 'カイ')
       ),
@@ -160,7 +163,7 @@
     {
       // 仕事を終えたサブは **司令席へ寄ってメインへ報告してから** 退室する
       //(利用者の指示)。作業報告カードはこの報告のあいだに出る。
-      // **充電中だったメインは司令席へ呼び戻される**(#66)
+      // 報告を待っていたメインはそのまま受ける(充電ステーションに居れば呼び戻される。#66)
       label: 'sub-2 が司令席で報告 → 退室(作業報告カード)',
       agents: agentsOf(
         main('desk', 'idle', 'カイ の報告を受けています'),
@@ -332,8 +335,10 @@
         sub(5, 'workshop', 'reading', 'レポート: 仕様を確認', 'ミライ')
       ),
     },
-    { label: 'Stop(応答完了)', agents: agentsOf(main('desk', 'idle', '応答完了。お疲れさまでした!')) },
-    // 60 秒イベントが無いとサーバーがここへ落とす(充電ステーションへ移動。#47)
+    // 応答が完了したら **すぐ充電ステーションへ移り、起きたまま待機**(DESIGN.md 4.29)。
+    // サブが働いていれば上の「サブの報告待ち」になる
+    { label: 'Stop(応答完了 → 充電ステーションで待機)', agents: agentsOf(main('lounge', 'idle', '応答完了。お疲れさまでした!')) },
+    // 待機が 60 秒続くと目を閉じて充電に入る(#47 / DESIGN.md 4.29)
     { label: 'アイドル(充電ステーションで充電)', agents: agentsOf(main('lounge', 'resting', '充電中')) },
   ];
 
